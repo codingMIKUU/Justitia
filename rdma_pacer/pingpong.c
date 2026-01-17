@@ -1,9 +1,10 @@
 #include "pingpong.h"
 
 static const int port = 18515;
+/* Verbs port numbers are 1-based (0 is invalid). */
 static const int ib_port = 1;
 static const int mtu = IBV_MTU_2048;
-static const int ib_dev_idx = 0;
+static const int ib_dev_idx = 1;
 //static const int ib_dev_idx = 1;
 //static const int ib_dev_idx = 2;  // used in xl170
 
@@ -73,7 +74,9 @@ static struct pingpong_context *alloc_monitor_qp() {
 
     //ib_dev = *dev_list; // pick the first device
     ib_dev = dev_list[ib_dev_idx];
-    printf("IB DEV NAME: %s\n", ib_dev->name);
+    if (ib_dev) {
+        printf("IB DEV NAME: %s\n", ibv_get_device_name(ib_dev));
+    }
     //printf("start printing all dev name from idx 0:\n");
     //printf("dev_list[0]: %s\n", dev_list[0]->name);
     //printf("dev_list[1]: %s\n", dev_list[1]->name);
@@ -81,6 +84,7 @@ static struct pingpong_context *alloc_monitor_qp() {
     //printf("dev_list[3]: %s\n", dev_list[3]->name);
     if (!ib_dev) {
         fprintf(stderr, "No IB devices found\n");
+        ibv_free_device_list(dev_list);
         return NULL;
     }
 
@@ -219,30 +223,42 @@ static struct pingpong_context *alloc_monitor_qp() {
     return ctx;
 
 clean_qp:
-    ibv_destroy_qp(ctx->qp);
-clean_send_cq:
-    ibv_destroy_cq(ctx->send_cq);
+    if (ctx->qp)
+        ibv_destroy_qp(ctx->qp);
 clean_recv_cq:
-    ibv_destroy_cq(ctx->recv_cq);
-clean_write_mr:
-    ibv_dereg_mr(ctx->send_mr);
-clean_send_mr:
-    ibv_dereg_mr(ctx->send_mr);
+    if (ctx->recv_cq)
+        ibv_destroy_cq(ctx->recv_cq);
+clean_send_cq:
+    if (ctx->send_cq)
+        ibv_destroy_cq(ctx->send_cq);
+clean_channels:
+    if (ctx->recv_channel)
+        ibv_destroy_comp_channel(ctx->recv_channel);
+    if (ctx->send_channel)
+        ibv_destroy_comp_channel(ctx->send_channel);
 clean_recv_mr:
-    ibv_dereg_mr(ctx->recv_mr);
+    if (ctx->recv_mr)
+        ibv_dereg_mr(ctx->recv_mr);
+clean_send_mr:
+    if (ctx->send_mr)
+        ibv_dereg_mr(ctx->send_mr);
+clean_write_mr:
+    if (ctx->write_mr)
+        ibv_dereg_mr(ctx->write_mr);
 clean_pd:
-    ibv_dealloc_pd(ctx->pd);
+    if (ctx->pd)
+        ibv_dealloc_pd(ctx->pd);
 clean_device:
-    ibv_close_device(ctx->context);
-clean_write_buf:
-    free(ctx->write_buf);
-clean_send_buf:
-    free(ctx->send_buf);
+    if (ctx->context)
+        ibv_close_device(ctx->context);
 clean_recv_buf:
     free(ctx->recv_buf);
+clean_send_buf:
+    free(ctx->send_buf);
+clean_write_buf:
+    free(ctx->write_buf);
 clean_ctx:
     free(ctx);
-
     ibv_free_device_list(dev_list);
     return NULL;
 }

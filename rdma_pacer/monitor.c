@@ -1,11 +1,13 @@
 #include "monitor.h"
-#include "pingpong.h"
+#include "pingpong.h"ASZ
 #include "get_clock.h"
 #include "pacer.h"
 #include "countmin.h"
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <errno.h>
+#include <string.h>
 
 #define TAIL 2
 
@@ -158,8 +160,13 @@ void monitor_latency(void *arg) {
             num_comp = ibv_poll_cq(ctx->recv_cq, 1, &recv_wc[i]);
             if (num_comp > 0) {
                 if (recv_wc[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "error bad recv_wc status: %u.%s\n", recv_wc[i].status, ibv_wc_status_str(recv_wc[i].status));
-                    break;
+                    if (recv_wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                        fprintf(stderr, "monitor_latency: recv WC flushed (QP is closing); stop monitoring.\n");
+                        return;
+                    }
+                    fprintf(stderr, "monitor_latency: bad recv_wc status: %u.%s\n",
+                            recv_wc[i].status, ibv_wc_status_str(recv_wc[i].status));
+                    return;
                 }
                 if (strncmp(ctx->recv_buf, "INFO:xxxx:xxxx", 5) == 0) {
                     sscanf(ctx->recv_buf, "INFO:%hu:%hu", &cb.num_receiver_big_flows[i], &cb.num_receiver_small_flows[i]);
@@ -206,8 +213,18 @@ void monitor_latency(void *arg) {
             } while (num_comp == 0);
 
             if (num_comp < 0 || wc[i].status != IBV_WC_SUCCESS) {
-                perror("ibv_poll_cq");
-                break;
+                if (num_comp < 0) {
+                    fprintf(stderr, "monitor_latency: ibv_poll_cq(send_cq) failed: errno=%d (%s)\n",
+                            errno, strerror(errno));
+                    return;
+                }
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                    fprintf(stderr, "monitor_latency: send WC flushed (QP is closing); stop monitoring.\n");
+                    return;
+                }
+                fprintf(stderr, "monitor_latency: bad send wc status: %u.%s\n",
+                        wc[i].status, ibv_wc_status_str(wc[i].status));
+                return;
             }
 
             end_cycle[i] = get_cycles();
@@ -419,7 +436,7 @@ void monitor_latency(void *arg) {
     CMH_Destroy(cmh);
 #endif
 
-    exit(1);
+    return;
 }
 
 
@@ -496,8 +513,13 @@ void server_loop(void *arg) {
             num_comp = ibv_poll_cq(ctx->recv_cq, 1, &recv_wc[i]);
             if (num_comp > 0) {     // found an update; actually num_comp should be either 0 or 1 given we set 'num_entires'=1 in ibv_poll_cq
                 if (recv_wc[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr, "error bad recv_wc status: %u.%s\n", recv_wc[i].status, ibv_wc_status_str(recv_wc[i].status));
-                    break;
+                    if (recv_wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                        fprintf(stderr, "server_loop: recv WC flushed (peer disconnected); stop server loop.\n");
+                        return;
+                    }
+                    fprintf(stderr, "server_loop: bad recv_wc status: %u.%s\n",
+                            recv_wc[i].status, ibv_wc_status_str(recv_wc[i].status));
+                    return;
                 }
 
                 //remote_receiver_fan_in = (uint32_t)strtol((const char *)ctx->update_recv_buf, NULL, 10);
@@ -537,8 +559,9 @@ void server_loop(void *arg) {
                 }
 
             } else if (num_comp < 0) {
-                perror("ibv_poll_cq: update_recv_wc");
-                exit(1);
+                fprintf(stderr, "server_loop: ibv_poll_cq(recv_cq) failed: errno=%d (%s)\n",
+                        errno, strerror(errno));
+                return;
             }
 
         }

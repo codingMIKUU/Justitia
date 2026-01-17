@@ -286,7 +286,11 @@ static void mlx5_local_cpu_set(struct mlx5_context *ctx, cpu_set_t *cpu_set)
 	struct ibv_context *context = &ctx->ibv_ctx;
 
 	if (!ibv_exp_cmd_getenv(context, "MLX5_LOCAL_CPUS", env_value, sizeof(env_value)))
-		strncpy(buf, env_value, sizeof(buf));
+	{
+		size_t len = strnlen(env_value, sizeof(buf) - 1);
+		memcpy(buf, env_value, len);
+		buf[len] = '\0';
+	}
 	else {
 		char fname[MAXPATHLEN];
 		FILE *fp;
@@ -1304,11 +1308,13 @@ struct ibv_device *openib_driver_init(struct sysfs_class_device *sysdev)
 {
 	int abi_ver = 0;
 	char value[8];
+	struct verbs_device *verbs_dev;
 
 	if (ibv_read_sysfs_file(sysdev->path, "abi_version",
 				value, sizeof value) > 0)
 		abi_ver = strtol(value, NULL, 10);
 
-	return mlx5_driver_init(sysdev->path, abi_ver);
+	verbs_dev = mlx5_driver_init(sysdev->path, abi_ver);
+	return verbs_dev ? &verbs_dev->device : NULL;
 }
 #endif /* HAVE_IBV_REGISTER_DRIVER */
