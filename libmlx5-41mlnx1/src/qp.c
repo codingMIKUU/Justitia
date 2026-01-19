@@ -51,9 +51,9 @@
 #include "pacer.h"
 #include <inttypes.h>
 #include <sys/time.h>
-int isSmall = 1; /* 0: elephant flow, 1: mouse flow */
+__thread int isSmall = -1; /* per-thread: 0=bw, 1=lat, 2=tput; -1 unset */
 int isRead = 0;
-int32_t debit = 0;
+__thread int32_t debit = 0;
 //double cpu_factor_table[] = {0,0.25,0.5,0.75,1};
 double cpu_factor_table[] = {0,0.5,0.5,0.7,0.9};    //value for first level is a don't-care (for 1MB chunks)
 //double cpu_factor_table[] = {1,1,1,1,1};
@@ -2433,11 +2433,13 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		start_flag = 0;
 		if (flow)
 		{
-			switch (qp->isSmall)
+			/* Scheme A: class is per-thread; first QP may initialize it */
+			if (isSmall < 0)
+				isSmall = qp->isSmall;
+			switch (isSmall)
 			{
 			case 0:
 			{
-				isSmall = 0;
 				if (wr->opcode == IBV_WR_RDMA_READ)
 				{
 					__atomic_store_n(&flow->read, 1, __ATOMIC_RELAXED);
@@ -2447,7 +2449,9 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				{
 					num_active_big_flows++;
 					contact_pacer(2);
+				#ifdef JUSTITIA_DEBUG
 					printf("DEBUG POST SEND: INDEED increment BIG flow counter\n");
+				#endif
 					__atomic_fetch_add(&sb->num_active_big_flows, 1, __ATOMIC_RELAXED);
 				    __atomic_fetch_add(&sb->num_active_bw_flows, 1, __ATOMIC_RELAXED);
 				}
@@ -2455,25 +2459,29 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			}
 			case 1:
 			{
-				isSmall = 1;
 				contact_pacer(2);
 				num_active_small_flows++;
+			#ifdef JUSTITIA_DEBUG
 				printf("DEBUG POST SEND: INDEED increment SMALL flow counter\n");
+			#endif
 				__atomic_fetch_add(&sb->num_active_small_flows, 1, __ATOMIC_RELAXED);
 				break;
 			}
 			case 2:
 			{
-				isSmall = 2;
 				contact_pacer(2);
 				num_active_big_flows++;
                 __atomic_fetch_add(&sb->num_active_big_flows, 1, __ATOMIC_RELAXED);
 				// num_active_small_flows++;
 				// printf("DEBUG POST SEND: INDEED increment SMALL flow counter\n");
 				// __atomic_fetch_add(&sb->num_active_small_flows, 1, __ATOMIC_RELAXED);
+			#ifdef JUSTITIA_DEBUG
 				printf("DEBUG POST SEND: TPUT SENSITIVE\n");
+			#endif
 				break;
 			}
+			default:
+				break;
 			}
 		}
 	}
@@ -2491,7 +2499,9 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	//	fflush(stdout);
 	//}
 	//printf("DEBUG: POST SEND: split_chunk_size = %" PRIu32 "; msg size = %d [%d]\n", split_chunk_size, wr->sg_list->length, ++GLOBAL_CNT);
+	#ifdef JUSTITIA_DEBUG
 	fflush(stdout);
+	#endif
 
 	int is_two_sided = 0;
 	int is_wimm = 0;
@@ -2790,8 +2800,10 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			if (wr->sg_list->length > split_chunk_size) {
 				wr->sg_list->length = split_chunk_size;
 			}
+		#ifdef JUSTITIA_DEBUG
 			printf("first chunk message length = %" PRIu32 "\n", wr->sg_list->length);
 			fflush(stdout);
+		#endif
 
 			ret = __mlx5_post_send(ibqp, (struct ibv_exp_send_wr *)wr, (struct ibv_exp_send_wr **)bad_wr, 0);
 			if (ret != 0) {
@@ -2800,14 +2812,18 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			}
 
 			// <2> post a SR to split_qp to send num_split_chunks as well as the current(updated)_chunk_size to the receiver and poll its wc
+		#ifdef JUSTITIA_DEBUG
 			printf("SENDER <2> post a SR to split_qp to send num_split_chunks and current(updated)_chunk_size to the receiver and poll its wc\n");
+		#endif
 
 			qp->split_fc_msg[1].type = INFO;
 			qp->split_fc_msg[1].msg.split_chunk_info.num_split_chunks = num_chunks_to_send;
 			qp->split_fc_msg[1].msg.split_chunk_info.current_chunk_size = split_chunk_size;
+		#ifdef JUSTITIA_DEBUG
 			printf("DEBUG POST SEND: qp->split_fc_msg.msg.split_chunk_info.num_split_chunks: %d\n", qp->split_fc_msg[1].msg.split_chunk_info.num_split_chunks);
 			printf("DEBUG POST SEND: qp->split_fc_msg.msg.split_chunk_info.current_chunk_size: %d\n", qp->split_fc_msg[1].msg.split_chunk_info.current_chunk_size);
 			fflush(stdout);
+		#endif
 
 			struct ibv_sge ssge;
 			struct ibv_send_wr swr;
@@ -2856,8 +2872,10 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			} while (ne == 0);
 
 			// <3> poll from split_cq for receiver's ACK
+		#ifdef JUSTITIA_DEBUG
 			printf("SENDER <3> poll from split_cq for receiver's ACK\n");
 			fflush(stdout);
+		#endif
 			if (num_chunks_to_send > 0) {
 				if (SPLIT_USE_EVENT) {
 					ret = ibv_get_cq_event(qp->split_comp_channel2, &ev_cq, &ev_ctx);

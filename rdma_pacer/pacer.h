@@ -78,7 +78,8 @@ struct control_block {
     //struct pingpong_context *ctx;           // used by each client
     struct pingpong_context *ctx_per_server[MAX_SERVERS];           // used by each client
     struct pingpong_context *ctx_per_client[MAX_CLIENTS];           // used by the server
-    pid_t pid_list[MAX_FLOWS];             /* used to map pid to slot; index is the slot number; treat flows from the same process as one */
+    pid_t pid_list[MAX_FLOWS];             /* slot -> pid */
+    pid_t tid_list[MAX_FLOWS];             /* slot -> tid (Linux gettid); enables per-thread scheduling */
     uint64_t tokens;                       /* number of available tokens */
     uint64_t tokens_read;
     uint64_t app_vaddrs[MAX_SERVERS];           // used to compare and find which flow/app sends to which direction

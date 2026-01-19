@@ -55,18 +55,63 @@
 //#include "verbs_pacer.h"
 #include "pacer.h"
 #include "get_clock.h"
-struct flow_info *flow = NULL;
+__thread struct flow_info *flow = NULL;
 struct shared_block *sb = NULL;
-int registered = 0;
-int start_flag = 0;
-unsigned int slot = 0;
+__thread int registered = 0;
+__thread int start_flag = 0;
+__thread unsigned int slot = 0;
 //int start_recv = 0;
-int num_active_small_flows = 0;
-int num_active_big_flows = 0;
+__thread int num_active_small_flows = 0;
+__thread int num_active_big_flows = 0;
+__thread int justitia_exit_done = 0;
 #ifdef CPU_FRIENDLY
 double cpu_mhz = 0;
+__thread unsigned int flow_socket = 0;
 #endif
 /* end */
+
+static pthread_mutex_t justitia_shm_lock = PTHREAD_MUTEX_INITIALIZER;
+static int justitia_process_handlers_installed = 0;
+
+static pthread_key_t justitia_thread_key;
+static pthread_once_t justitia_thread_key_once = PTHREAD_ONCE_INIT;
+
+static int justitia_is_pacer_process(void)
+{
+	int fd = open("/proc/self/comm", O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	char name[64];
+	ssize_t n = read(fd, name, sizeof(name) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+
+	name[n] = '\0';
+	char *nl = strchr(name, '\n');
+	if (nl)
+		*nl = '\0';
+
+	return strcmp(name, "pacer") == 0;
+}
+
+static void justitia_thread_destructor(void *value)
+{
+	(void)value;
+	set_inactive_on_exit();
+}
+
+static void justitia_make_thread_key(void)
+{
+	(void)pthread_key_create(&justitia_thread_key, justitia_thread_destructor);
+}
+
+static void justitia_register_thread_cleanup(void)
+{
+	pthread_once(&justitia_thread_key_once, justitia_make_thread_key);
+	(void)pthread_setspecific(justitia_thread_key, (void *)1);
+}
 
 int mlx5_single_threaded = 0;
 int mlx5_use_mutex;
@@ -2407,14 +2452,18 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 	if (split_qp2 == NULL) {
 		printf("Create split qp2 failed. %s\n", strerror(errno));
 	}
+	#ifdef JUSTITIA_DEBUG
 	printf("DEBUG mlx5_create_qp: split_qp->qpn = %06x\n", split_qp2->qp_num);
+	#endif
 
 	int i;
 	//for (i = 0; i < MAX_SPLIT_QP_NUM_ONE_SIDED; i++) {
 	for (i = MAX_SPLIT_QP_NUM_ONE_SIDED - 1; i >= 0 ; i--) {
 		split_qp[i] = __mlx5_create_qp(pd, &split_init_attr);
 		if (split_qp[i]) {
+			#ifdef JUSTITIA_DEBUG
 			printf("DEBUG mlx4_create_qp: split_qp[%d]->qpn = %06x\n", i, split_qp[i]->qp_num);
+			#endif
 		} else {
 			fprintf(stderr, "Error creating Split QP #%d\n", i + 1);
 			return NULL;
@@ -2426,7 +2475,9 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 	if (qp == NULL) {
 		printf("Create user qp failed. %s\n", strerror(errno));
 	}
+	#ifdef JUSTITIA_DEBUG
 	printf("DEBUG mlx5_create_qp: orig_qp->qpn = %06x\n", qp->qp_num);
+	#endif
 	//// store split_qp & split_cq inside the user's qp
 	if (qp) {
 		struct mlx5_qp *mqp = to_mqp(qp);
@@ -2453,7 +2504,14 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 		}
 		//// set whether user has set the qp to send mice flows
 		mqp->isSmall = (long)attr->qp_context;
+		if (mqp->isSmall < 0 || mqp->isSmall > 2)
+			mqp->isSmall = 0;
+		/* Scheme A: per-thread class is decided once; later QPs in same thread inherit */
+		if (isSmall < 0)
+			isSmall = mqp->isSmall;
+		#ifdef JUSTITIA_DEBUG
 		printf("mqp->isSmall is %d\n", mqp->isSmall);
+		#endif
 	} else {
 		fprintf(stderr, "Error creating Split QP\n");
 		return qp;
@@ -2465,8 +2523,17 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 	if ((fd_shm = shm_open(SHARED_MEM_NAME, O_RDWR, 0600)) == -1){
 		printf("@@@Pacer's shared memory is not found. Pacer won't be used.\n");
 	} else {
-		if (!registered) {
-			registered = 1;
+		if (justitia_is_pacer_process()) {
+			/* Never control the pacer itself; it must not consume a slot. */
+			return qp;
+		}
+		pthread_mutex_lock(&justitia_shm_lock);
+		if (!sb) {
+			sb = mmap(NULL, sizeof(struct shared_block), PROT_WRITE | PROT_READ,
+				MAP_SHARED, fd_shm, 0);
+		}
+		if (!justitia_process_handlers_installed) {
+			justitia_process_handlers_installed = 1;
 			/* set up signal handler */
 		    struct sigaction new_action, old_action;
 		    new_action.sa_handler = termination_handler;
@@ -2487,11 +2554,17 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 		    /* end */
 			atexit(set_inactive_on_exit);
 		}
-		sb = mmap(NULL, sizeof(struct shared_block), PROT_WRITE | PROT_READ,
-			MAP_SHARED, fd_shm, 0);
-		contact_pacer(1);
-		flow = &sb->flows[slot];
-		printf("@@@At slot %d.\n", slot);
+		pthread_mutex_unlock(&justitia_shm_lock);
+
+		/* Per-thread registration: each thread gets its own flow slot */
+		if (!registered) {
+			registered = 1;
+			justitia_register_thread_cleanup();
+			contact_pacer(1);
+			flow = sb ? &sb->flows[slot] : NULL;
+			start_flag = 1;
+			printf("@@@Thread registered at slot %d.\n", slot);
+		}
 	}
 	/* end */	
 
@@ -3173,8 +3246,10 @@ int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			ret = 1;
 			goto err;
 		}
+	#ifdef JUSTITIA_DEBUG
 		printf("<<<<MODIFY SPLIT QP to INIT>>>>\n");
 		fflush(stdout);
+	#endif
 	} else if (qp->state == IBV_QPS_RTR && mqp->split_qp[0]->state == IBV_QPS_INIT) {
 		//attr->dest_qp_num -= 1;	// for old benchmark
 		//attr->dest_qp_num -= 2; // for new benchmark
@@ -3206,8 +3281,10 @@ int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			ret = 1;
 			goto err;
 		}
+	#ifdef JUSTITIA_DEBUG
 		printf("<<<<MODIFY SPLIT QP to RTR>>>>\n");
 		fflush(stdout);
+	#endif
 		//// pre-post a RR for later use
 		//printf("DEBUG MODIFY QP: post a RR to split_qp\n");
 		struct ibv_sge sge;
@@ -3274,10 +3351,11 @@ int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			ret = 1;
 			goto err;
 		}
+	#ifdef JUSTITIA_DEBUG
 		printf("<<<<MODIFY SPLIT QP to RTS>>>>\n");
-
 		printf("<<<<Request SPLIT CQ evnt notification\n");
 		fflush(stdout);
+	#endif
 		if (SPLIT_USE_EVENT) {
 			ret = ibv_req_notify_cq(mqp->split_send_cq, 0); 
 			if (ret) {

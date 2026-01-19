@@ -44,17 +44,18 @@ struct shared_block {
     uint16_t split_level;
 };
 
-extern struct flow_info *flow;     /* declaration; initialization in verbs.c */
-extern struct shared_block *sb;    /* declaration; initialization in verbs.c */
-extern int start_flag;             /* Initialized in verbs.c */
-extern unsigned int slot;          /* Initialized in verbs.c */
+extern __thread struct flow_info *flow;     /* per-thread flow slot; initialization in verbs.c */
+extern struct shared_block *sb;            /* process-wide shared memory mapping; initialization in verbs.c */
+extern __thread int start_flag;            /* per-thread: whether this thread has reported its app type */
+extern __thread unsigned int slot;         /* per-thread slot id */
 extern int start_recv;             /* initialized in qp.c */
-extern int isSmall;                /* initialized in qp.c */
-extern int num_active_small_flows; /* initialized in verbs.c */
-extern int num_active_big_flows;   /* initialized in verbs.c */
+extern __thread int isSmall;                /* per-thread class: 0=bw,1=lat,2=tput; initialized in qp.c */
+extern __thread int num_active_small_flows; /* per-thread counters for cleanup */
+extern __thread int num_active_big_flows;   /* per-thread counters for cleanup */
+extern __thread int justitia_exit_done;     /* per-thread: ensure exit handler runs once */
 //// UDS_IMPL
 #ifdef CPU_FRIENDLY
-unsigned int flow_socket;
+extern __thread unsigned int flow_socket;
 extern double cpu_mhz;              /* declaration; initialization in verbs.c */
 #endif
 ////

@@ -453,8 +453,16 @@ void server_loop(void *arg) {
     struct ibv_wc send_wc[MAX_CLIENTS], recv_wc[MAX_CLIENTS];
     int num_comp;
     //uint32_t current_receiver_fan_in = 0;
-    uint16_t current_num_big_apps = 0;       // bw or tput
-    uint16_t current_num_small_apps = 0;     // lat
+    /*
+     * NOTE:
+     *   These counters are used only as non-negative application counts
+     *   (number of big/small apps per receiver) and are later exported
+     *   to senders via the "INFO:bbbb:ssss" monitor messages.
+     *   They must never wrap around when decremented below 0.
+     *   Use 32-bit types for safety and clamp on decrement.
+     */
+    uint32_t current_num_big_apps = 0;       // bw or tput
+    uint32_t current_num_small_apps = 0;     // lat
 
     int i = 0;
     for (i = 0; i < params->num_clients; i++) {
@@ -528,9 +536,16 @@ void server_loop(void *arg) {
                 } else if (strcmp(ctx->recv_buf, "small_inc") == 0) {
                     current_num_small_apps++;
                 } else if (strcmp(ctx->recv_buf, "big_dec") == 0) {
-                    current_num_big_apps--;
+                    /*
+                     * Guard against underflow: protocol bugs or duplicate
+                     * exit notifications must not make the counter wrap to
+                     * 2^N-1 and break fairness logic.
+                     */
+                    if (current_num_big_apps > 0)
+                        current_num_big_apps--;
                 } else if (strcmp(ctx->recv_buf, "small_dec") == 0) {
-                    current_num_small_apps--;
+                    if (current_num_small_apps > 0)
+                        current_num_small_apps--;
                 } else {
                     printf("Unrecognized receiver-update msg. exit\n");
                     exit(1);
@@ -549,7 +564,15 @@ void server_loop(void *arg) {
                 for (j = 0; j < params->num_clients; j++) {
                     ctx = cb.ctx_per_client[j];
 
-                    sprintf(ctx->send_buf, "INFO:%04hu:%04hu", current_num_big_apps, current_num_small_apps);
+                    /*
+                     * Downcast to 16-bit fields in INFO message for
+                     * wire-compatibility, but clamp to 0xffff to avoid
+                     * unexpected wrap on the sender side.
+                     */
+                    uint16_t big_apps  = (current_num_big_apps  > UINT16_MAX) ? UINT16_MAX : (uint16_t)current_num_big_apps;
+                    uint16_t small_apps = (current_num_small_apps > UINT16_MAX) ? UINT16_MAX : (uint16_t)current_num_small_apps;
+
+                    sprintf(ctx->send_buf, "INFO:%04hu:%04hu", big_apps, small_apps);
                     if (ibv_post_send(ctx->qp, &send_wr[j], &bad_send_wr[j])) {
                         perror("ibv_post_send: broadcast info to all senders");
                     }

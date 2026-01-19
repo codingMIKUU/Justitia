@@ -1,5 +1,7 @@
 #include "pacer.h"
 
+#include <sys/syscall.h>
+
 
 char *get_sock_path() {
     FILE *fp;
@@ -32,7 +34,7 @@ char *get_sock_path() {
     return SOCK_PATH;
 }
 
-// join=0 -> exit; join=1 -> first join and ask pacer for slot; join=2 -> tell pacer about the type of the app (0:bw, 1:lat, 2:tput)
+// join=0 -> exit; join=1 -> first join and ask pacer for slot; join=2 -> tell pacer about the type of the app (0:bw, 1:lat, 2:tput); join=3 -> deregister slot mapping
 //void contact_pacer(int join, uint64_t vaddr) {
 void contact_pacer(int join) {
     /* prepare unix domain socket */
@@ -69,6 +71,8 @@ void contact_pacer(int join) {
             strcpy(str, "exit_app_lat");
         } else if (isSmall == 2) {
             strcpy(str, "exit_app_tput");
+        } else {
+            strcpy(str, "exit_app_bw");
         }
         if (send(s, str, strlen(str), 0) == -1) {
             perror("send: exit");
@@ -105,10 +109,11 @@ void contact_pacer(int join) {
         }
         memset(str, 0, MSG_LEN);
 
-        /* send process ID */
+        /* send pid:tid so pacer can schedule per-thread */
         pid_t my_pid = getpid();
-        printf("My PID is %d\n", my_pid);
-        len = snprintf(str, MSG_LEN, "%d", my_pid);
+        pid_t my_tid = (pid_t)syscall(SYS_gettid);
+        printf("My PID is %d, TID is %d\n", my_pid, my_tid);
+        len = snprintf(str, MSG_LEN, "%d:%d", my_pid, my_tid);
         //printf("length of pid message is %d\n", len);
         if (send(s, str, len, 0) == -1) {
             perror("error in sending pid: ");
@@ -130,6 +135,8 @@ void contact_pacer(int join) {
         flow_socket = s;
         // don't close (s) in case of join
         // this connection is the one we use to recv tokens in token_enforcement impl
+#else
+    close(s);
 #endif
     } else if (join == 2) {
         /* tell daemon about my app type */
@@ -149,13 +156,27 @@ void contact_pacer(int join) {
             exit(1);
         }
         close(s);
+    } else if (join == 3) {
+        pid_t my_pid = getpid();
+        pid_t my_tid = (pid_t)syscall(SYS_gettid);
+        len = snprintf(str, MSG_LEN, "l:%d:%d", my_pid, my_tid);
+        if (send(s, str, len, 0) == -1) {
+            perror("send: leave");
+            exit(1);
+        }
+        close(s);
     }
 }
 
 void set_inactive_on_exit() {
+    /* make exit handler idempotent per-thread */
+    if (justitia_exit_done)
+        return;
+
     if (flow) {
-        if (isSmall) {
-            __atomic_fetch_sub(&sb->num_active_small_flows, num_active_small_flows, __ATOMIC_RELAXED);
+        if (isSmall == 1) {
+            if (num_active_small_flows)
+                __atomic_fetch_sub(&sb->num_active_small_flows, num_active_small_flows, __ATOMIC_RELAXED);
             contact_pacer(0);
             printf("DEBUG decrement SMALL counter by %d\n", num_active_small_flows);
         } else if (__atomic_load_n(&flow->read, __ATOMIC_RELAXED)) {
@@ -163,13 +184,31 @@ void set_inactive_on_exit() {
             __atomic_store_n(&flow->read, 0, __ATOMIC_RELAXED);
             contact_pacer(0);
         } else {
-            __atomic_fetch_sub(&sb->num_active_big_flows, num_active_big_flows, __ATOMIC_RELAXED);
+            if (num_active_big_flows)
+                __atomic_fetch_sub(&sb->num_active_big_flows, num_active_big_flows, __ATOMIC_RELAXED);
             printf("DEBUG decrement BIG counter by %d\n", num_active_big_flows);
             contact_pacer(0);
         }
         __atomic_store_n(&flow->pending, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&flow->active, 0, __ATOMIC_RELAXED);
-        printf("libmlx4 exit\n");
+
+#ifdef CPU_FRIENDLY
+        if (flow_socket) {
+            close(flow_socket);
+            flow_socket = 0;
+        }
+#endif
+
+    /* Return this thread's slot to pacer (scheme A: per-thread slots) */
+    contact_pacer(3);
+
+        flow = NULL;
+        slot = 0;
+        start_flag = 1;
+        num_active_small_flows = 0;
+        num_active_big_flows = 0;
+        printf("libmlx4 thread exit\n");
+        justitia_exit_done = 1;
     }
 }
 

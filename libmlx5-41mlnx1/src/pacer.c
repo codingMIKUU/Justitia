@@ -1,4 +1,7 @@
+
 #include "pacer.h"
+
+#include <sys/syscall.h>
 
 
 char *get_sock_path() {
@@ -12,17 +15,13 @@ char *get_sock_path() {
 
     char hostname[100];
     if(fgets(hostname, 100, fp) != NULL) {
-        //char *sock_path = (char *)malloc(108 * sizeof(char));
         char *sock_path = (char *)calloc(108, sizeof(char));
-        //printf("DE hostname:%s\n", hostname);
         int len = strlen(hostname);
         if (len > 0 && hostname[len-1] == '\n') hostname[len-1] = '\0';
         strcat(hostname, "_rdma_socket");
         strcpy(sock_path, getenv("HOME"));
         len = strlen(sock_path);
         sock_path[len] = '/';
-        //printf("DE: len(sock_path) = %d\n", len);
-        //printf("DE: sock_path:%s\n", sock_path);
         strcat(sock_path, hostname);
         fclose(fp);
         return sock_path;
@@ -32,10 +31,8 @@ char *get_sock_path() {
     return SOCK_PATH;
 }
 
-// join=0 -> exit; join=1 -> first join and ask pacer for slot; join=2 -> tell pacer about the type of the app (0:bw, 1:lat, 2:tput)
-//void contact_pacer(int join, uint64_t vaddr) {
+// join=0 -> exit_app_*; join=1 -> join + get slot; join=2 -> app_*; join=3 -> deregister slot mapping
 void contact_pacer(int join) {
-    /* prepare unix domain socket */
     char *sock_path = get_sock_path();
     unsigned int s, len;
     struct sockaddr_un remote;
@@ -48,13 +45,9 @@ void contact_pacer(int join) {
         exit(1);
     }
 
-    printf("Contacting pacer...\n");
-
     remote.sun_family = AF_UNIX;
     strcpy(remote.sun_path, sock_path);
     free(sock_path);
-    printf("SUN_PATH = %s\n", remote.sun_path);
-    printf("SOCK_PATH = %s\n", SOCK_PATH);
     len = strlen(remote.sun_path) + sizeof(remote.sun_family);
     if (connect(s, (struct sockaddr *)&remote, len) == -1) {
         perror("connect");
@@ -69,32 +62,30 @@ void contact_pacer(int join) {
             strcpy(str, "exit_app_lat");
         } else if (isSmall == 2) {
             strcpy(str, "exit_app_tput");
+        } else {
+            strcpy(str, "exit_app_bw");
         }
         if (send(s, str, strlen(str), 0) == -1) {
             perror("send: exit");
             exit(1);
         }
         close(s);
-    } else if (join == 1) {
-        /* send join message */
-        printf("Sending join message...\n");
-        //strcpy(str, "join:");
+        return;
+    }
+
+    if (join == 1) {
         sprintf(str, "join:%016Lx", vaddr);
         if (send(s, str, strlen(str), 0) == -1) {
             perror("send: join");
             exit(1);
         }
 
-        /* recv sender/receiver prompt (instead of string "pid") */
         if ((len = recv(s, str, MSG_LEN, 0)) > 0) {
             str[len] = '\0';
             if (strncmp(str, "sender:xxx", 6) == 0) {
                 sscanf(str, "sender:%x", &vaddr_idx);
-                printf("I'm a sender; vaddr_idx = %d\n", vaddr_idx);
-
-            } else if (strcmp(str, "recver") == 0) {
-                printf("I'm a receiver.\n");
-            } else {
+                (void)vaddr_idx;
+            } else if (strcmp(str, "recver") != 0) {
                 printf("unrecognized string. must be \"sender\" or \"recver\"\n");
                 exit(1);
             }
@@ -103,19 +94,15 @@ void contact_pacer(int join) {
             else printf("Server closed connection\n");
             exit(1);
         }
-        memset(str, 0, MSG_LEN);
 
-        /* send process ID */
         pid_t my_pid = getpid();
-        printf("My PID is %d\n", my_pid);
-        len = snprintf(str, MSG_LEN, "%d", my_pid);
-        //printf("length of pid message is %d\n", len);
+        pid_t my_tid = (pid_t)syscall(SYS_gettid);
+        len = snprintf(str, MSG_LEN, "%d:%d", my_pid, my_tid);
         if (send(s, str, len, 0) == -1) {
-            perror("error in sending pid: ");
+            perror("send: pid:tid");
             exit(1);
         }
 
-        /* receive the slot number */
         if ((len = recv(s, str, MSG_LEN, 0)) > 0) {
             str[len] = '\0';
         } else {
@@ -124,21 +111,23 @@ void contact_pacer(int join) {
             exit(1);
         }
         slot = strtol(str, NULL, 10);
-        printf("Received slot number: %d\n", slot);
 
 #ifdef CPU_FRIENDLY
         flow_socket = s;
-        // don't close (s) in case of join
-        // this connection is the one we use to recv tokens in token_enforcement impl
+        return;
+#else
+        close(s);
+        return;
 #endif
-    } else if (join == 2) {
-        /* tell daemon about my app type */
+    }
+
+    if (join == 2) {
         memset(str, 0, MSG_LEN);
         if (isSmall == 0) {
             strcpy(str, "app_bw");
         } else if (isSmall == 1) {
             strcpy(str, "app_lat");
-        } else if (isSmall == 2){
+        } else if (isSmall == 2) {
             strcpy(str, "app_tput");
         } else {
             printf("unrecognized app type. Exit\n");
@@ -149,31 +138,67 @@ void contact_pacer(int join) {
             exit(1);
         }
         close(s);
+        return;
     }
+
+    if (join == 3) {
+        pid_t my_pid = getpid();
+        pid_t my_tid = (pid_t)syscall(SYS_gettid);
+        len = snprintf(str, MSG_LEN, "l:%d:%d", my_pid, my_tid);
+        if (send(s, str, len, 0) == -1) {
+            perror("send: leave");
+            exit(1);
+        }
+        close(s);
+        return;
+    }
+
+    close(s);
 }
 
 void set_inactive_on_exit() {
-    if (flow) {
-        if (isSmall) {
+    /* make exit handler idempotent per-thread */
+    if (justitia_exit_done)
+        return;
+
+    if (!flow)
+        return;
+
+    if (isSmall == 1) {
+        if (num_active_small_flows)
             __atomic_fetch_sub(&sb->num_active_small_flows, num_active_small_flows, __ATOMIC_RELAXED);
-            contact_pacer(0);
-            printf("DEBUG decrement SMALL counter by %d\n", num_active_small_flows);
-        } else if (__atomic_load_n(&flow->read, __ATOMIC_RELAXED)) {
-            //TODO: fix READ exit later
-            __atomic_store_n(&flow->read, 0, __ATOMIC_RELAXED);
-            contact_pacer(0);
-        } else {
+        contact_pacer(0);
+    } else if (__atomic_load_n(&flow->read, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&flow->read, 0, __ATOMIC_RELAXED);
+        contact_pacer(0);
+    } else {
+        if (num_active_big_flows)
             __atomic_fetch_sub(&sb->num_active_big_flows, num_active_big_flows, __ATOMIC_RELAXED);
-            printf("DEBUG decrement BIG counter by %d\n", num_active_big_flows);
-            contact_pacer(0);
-        }
-        __atomic_store_n(&flow->pending, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&flow->active, 0, __ATOMIC_RELAXED);
-        printf("libmlx4 exit\n");
+        contact_pacer(0);
     }
+
+    __atomic_store_n(&flow->pending, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&flow->active, 0, __ATOMIC_RELAXED);
+
+#ifdef CPU_FRIENDLY
+    if (flow_socket) {
+        close(flow_socket);
+        flow_socket = 0;
+    }
+#endif
+
+    contact_pacer(3);
+
+    flow = NULL;
+    slot = 0;
+    start_flag = 1;
+    num_active_small_flows = 0;
+    num_active_big_flows = 0;
+
+    justitia_exit_done = 1;
 }
 
 void termination_handler(int sig) {
     set_inactive_on_exit();
-    _exit(1);       // _exit?
+    _exit(1);
 }

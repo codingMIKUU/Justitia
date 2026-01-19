@@ -188,7 +188,7 @@ void logging_tokens()
 }
 /* end */
 
-int find_next_slot(pid_t pid)
+static int find_next_slot(pid_t pid, pid_t tid)
 {
     int i, ret_slot = -1, match = 0;
     if (pid == -1) {
@@ -196,10 +196,16 @@ int find_next_slot(pid_t pid)
         exit(1);
     }
 
+    if (tid == -1) {
+        printf("Invalid tid. Exiting.\n");
+        exit(1);
+    }
+
     for (i = 0; i < MAX_FLOWS; i++) {
-        if (cb.pid_list[i] == pid) {
-            printf("PID(%d) match at slot %d\n", pid, i);
+        if (cb.pid_list[i] == pid && cb.tid_list[i] == tid) {
+            printf("PID(%d) TID(%d) match at slot %d\n", pid, tid, i);
             cb.pid_list[i] = pid;
+            cb.tid_list[i] = tid;
             ret_slot = i;
             match = 1;
             break;
@@ -222,6 +228,7 @@ int find_next_slot(pid_t pid)
         exit(1);
     } else {
         cb.pid_list[ret_slot] = pid;
+        cb.tid_list[ret_slot] = tid;
     }
 
     return ret_slot;
@@ -251,6 +258,7 @@ static void flow_handler(void *arg)
     char buf_pid[MSG_LEN];
     char *sock_path = get_sock_path();
     pid_t pid;
+    pid_t tid;
     int num_comp;
 
     struct ibv_send_wr send_wr, *bad_wr = NULL;
@@ -326,16 +334,26 @@ static void flow_handler(void *arg)
                 }
             }
 
-            /* receive pid from process */
+            /* receive pid/tid from process */
             len = recv(s2, (void *)buf_pid, (size_t)MSG_LEN, 0);
             //printf("receive pid message of length %d.\n", len);
             //printf("message is %s.\n", buf_pid);
             buf_pid[len] = '\0';
-            pid = strtol(buf_pid, NULL, 10);
-            printf("received pid: %d\n", pid);
+            tid = -1;
+            if (strchr(buf_pid, ':')) {
+                if (sscanf(buf_pid, "%d:%d", &pid, &tid) != 2) {
+                    printf("Invalid pid:tid format: %s. Exit\n", buf_pid);
+                    exit(1);
+                }
+            } else {
+                /* Backward compatibility: old clients send only pid */
+                pid = strtol(buf_pid, NULL, 10);
+                tid = pid;
+            }
+            printf("received pid=%d tid=%d\n", pid, tid);
 
             /* find the slot number based on the pid received */
-            cb.next_slot = find_next_slot(pid);
+            cb.next_slot = find_next_slot(pid, tid);
 
             //// UDS_IMPL
 #ifdef CPU_FRIENDLY
@@ -447,7 +465,33 @@ static void flow_handler(void *arg)
                 } while (num_comp == 0);
                 printf("sent a msg to remote receiver on WRITE ARRIVAL; %s\n", buf);
             }
+        } else if (buf[0] == 'l' && buf[1] == ':') {
+            /* Thread/process deregistration: free slot mapping so it can be reused */
+            if (sscanf(buf + 2, "%d:%d", &pid, &tid) != 2) {
+                printf("Invalid leave format: %s. Exit\n", buf);
+                exit(1);
+            }
+
+            int i;
+            for (i = 0; i < MAX_FLOWS; i++) {
+                if (cb.pid_list[i] == pid && cb.tid_list[i] == tid) {
+                    cb.pid_list[i] = -1;
+                    cb.tid_list[i] = -1;
+                    cb.sb->flows[i].active = 0;
+                    cb.sb->flows[i].pending = 0;
+                    cb.sb->flows[i].read = 0;
+                    break;
+                }
+            }
         }
+
+#ifndef CPU_FRIENDLY
+        close(s2);
+#else
+        /* In CPU_FRIENDLY mode, keep join sockets open for token delivery */
+        if (strncmp(buf, "join:xxxx", 4) != 0)
+            close(s2);
+#endif
     }
 }
 
@@ -804,6 +848,7 @@ int main(int argc, char **argv)
         cb.sb->flows[i].pending = 0;
         cb.sb->flows[i].active = 0;
         cb.pid_list[i] = -1;
+        cb.tid_list[i] = -1;
     }
     for (i = 0; i < MAX_SERVERS; i++) {
         cb.app_vaddrs[i] = 0;
