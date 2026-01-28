@@ -19,10 +19,11 @@
 #include "pingpong.h"
 
 #define SHARED_MEM_NAME "/rdma-fairness"
-#define MAX_FLOWS 512
+#define MAX_FLOWS 1024
 #define MAX_CLIENTS 36      // clients per server
 #define MAX_SERVERS 4       // servers (receivers) per clients
 // IMPORTANT: use the correct line rate
+//#define LINE_RATE_MB 40000
 #define LINE_RATE_MB 22500 /* MBps */    // 200Gbps
 //#define LINE_RATE_MB 12000 /* MBps */     // 100Gbps
 //#define LINE_RATE_MB 1100 /* MBps */      // 10Gbps

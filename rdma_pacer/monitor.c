@@ -336,6 +336,7 @@ void monitor_latency(void *arg) {
                 min_virtual_link_cap = round((double)(num_local_big_flows + num_remote_big_reads) 
                     / (cb.num_receiver_big_flows[0] + 1 + num_remote_big_reads) * LINE_RATE_MB);      // assume a single receiver
 #endif
+                //printf("calculated min_virtual_link_cap: %" PRIu32 " MBps\n", min_virtual_link_cap);
                 if (min_virtual_link_cap > LINE_RATE_MB) {      // could happen if haven't received info from the receiver
                     min_virtual_link_cap = LINE_RATE_MB;
                 }

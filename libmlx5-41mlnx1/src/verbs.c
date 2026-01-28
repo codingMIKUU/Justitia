@@ -2419,8 +2419,15 @@ struct ibv_qp *__mlx5_create_qp(struct ibv_pd *pd,
 }
 
 struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
-			      struct ibv_qp_init_attr *attr)
+                              struct ibv_qp_init_attr *attr)
 {
+	/*
+	 * QP number allocation is global per context; in multi-threaded runs the
+	 * original assumption "split_qp qpn = user_qp qpn - SPLIT_QP_NUM_DIFF"
+	 * breaks if creations interleave across threads. Serialize creation so the
+	 * split_qp/ split_qp2 / user_qp are allocated back-to-back and the fixed
+	 * offset stays valid.
+	 */
 	//// create custom cq used for two-sided rdma message splitting
 	struct ibv_comp_channel *send_channel = ibv_create_comp_channel(pd->context);
 	struct ibv_comp_channel *recv_channel = ibv_create_comp_channel(pd->context);

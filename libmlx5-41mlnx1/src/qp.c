@@ -2209,6 +2209,17 @@ static inline int __mlx5_post_send(struct ibv_qp *ibqp, struct ibv_exp_send_wr *
 		if (unlikely(!(qp->gen_data.create_flags & IBV_EXP_QP_CREATE_IGNORE_SQ_OVERFLOW) &&
 			     mlx5_wq_overflow(0, nreq, qp))) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "work queue overflow\n");
+			/* Extra debug for ENOMEM on send SQ (including split_qp) */
+			fprintf(stderr,
+				"Justitia DEBUG: SQ overflow on QP %u (ctx=%p): head=%u tail=%u max_post=%u nreq=%d is_rq=%d\n",
+				qp->verbs_qp.qp.qp_num,
+				qp->verbs_qp.qp.qp_context,
+				qp->sq.head,
+				qp->sq.tail,
+				qp->sq.max_post,
+				nreq,
+				0);
+			fflush(stderr);
 			errno = ENOMEM;
 			err = errno;
 			*bad_wr = wr;
@@ -2715,6 +2726,15 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				do {
 					ne = mlx5_poll_cq_1(qp->split_send_cq, 1, &wc);
 					//printf("ne = %d\n", ne);
+					if (ne > 0 && wc.status != IBV_WC_SUCCESS) {
+						fprintf(stderr,
+							"Justitia DEBUG: split_qp CQE error: status=%d opcode=%d qp_num=%u wr_id=%llu\n",
+							wc.status,
+							wc.opcode,
+							wc.qp_num,
+							(unsigned long long)wc.wr_id);
+						fflush(stderr);
+					}
 				} while (ne == 0);
 			} else {
 				printf("Shouldn't be the case\n");
@@ -3272,7 +3292,18 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					ret = __mlx5_post_send(qp->split_qp[qp_idx], (struct ibv_exp_send_wr *)&swr, (struct ibv_exp_send_wr **)bad_wr, 0);
 					if (ret != 0) {
 						errno = ret;
-						fprintf(stderr, "error posting one-sided send requests to split qp, errno = %d: %s\n", errno, strerror(errno));
+						fprintf(stderr,
+							"error posting one-sided send requests to split qp, errno=%d (%s), opcode=%d, orig_len=%u, split_chunk_size=%u, num_chunks_to_send=%u, num_wrs_to_split_qp=%d, i=%d, qp_idx=%d, user_qpn=%u, split_qpn=%u, qp_sq_head=%u, qp_sq_wqe_cnt=%u, send_flags=0x%x, wr_id=%llu\n",
+							errno, strerror(errno), wr->opcode,
+							orig_sge_length, split_chunk_size,
+							num_chunks_to_send, num_wrs_to_split_qp,
+							i, qp_idx,
+							qp->verbs_qp.qp.qp_num,
+							qp->split_qp[qp_idx] ? qp->split_qp[qp_idx]->qp_num : 0,
+							qp->sq.head,
+							qp->sq.wqe_cnt,
+							swr.send_flags,
+							(unsigned long long)swr.wr_id);
 						goto out;
 					}
                     //printf("qp_idx = %d\n", qp_idx);
@@ -3298,6 +3329,16 @@ int split_mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 						do {
 							ne = mlx5_poll_cq_1(qp->split_send_cq, 1, &wc);
 							//printf("ne = %d\n", ne);
+							if (ne > 0 && wc.status != IBV_WC_SUCCESS) {
+						fprintf(stderr,
+							"Justitia DEBUG: split_qp CQE error: status=%d opcode=%d qp_num=%u wr_id=%llu\n",
+							wc.status,
+							wc.opcode,
+							wc.qp_num,
+							(unsigned long long)wc.wr_id);
+						fflush(stderr);
+						sleep(1);
+					}
 						} while (ne == 0);	
                         //printf("i = %d\n", i);
 					}

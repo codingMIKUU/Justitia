@@ -1,0 +1,1033 @@
+#include <fcntl.h>
+#include <gflags/gflags.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#include <algorithm>
+#include <condition_variable>
+#include <cstdio>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <numeric>
+#include <thread>
+#include <vector>
+#include <cmath>
+#include "smart.h"
+
+
+#include "libhrd_cpp/hrd.h"
+#define CPU_FREQUENCY_HZ 2900000000.0
+static constexpr size_t kAppBufSize = MB(2);
+static constexpr int kAppBaseSHMKey = 2;
+
+static constexpr size_t kAppDefaultRunTime = 1000000;
+static constexpr size_t kAppRunTimeSlack = 10;
+
+// Number of outstanding requests kept by a server thread across all QPs.
+// This is only used for READs where we can detect completion by polling on
+// a READ's destination buffer.
+//
+// For WRITEs, this is hard to do unless we make every send() signaled. So,
+// the number of per-thread outstanding operations per thread with WRITEs is
+// O(NUM_CLIENTS * kAppUnsigBatch).
+static constexpr size_t kAppWindowSize = 1;
+static const char* SERVER_XRCD_FILE_PATH = "/tmp/server_xrcd";
+static_assert(is_power_of_two(kAppWindowSize), "");
+
+// Sweep paramaters
+static constexpr size_t kAppNumServers = 1;
+static constexpr size_t kAppNumClients = 1;  // Total client QPs in cluster
+static constexpr size_t kAppNumClientMachines = 1;
+static constexpr size_t kAppUnsigBatch = 1;//qp的总size需要是batch的两倍，原因是聚合。
+static constexpr size_t kAppLatBatch = 1;
+// static_assert(kHrdSQDepth == 128, "");  // Small queues => more scalaing
+static_assert(kAppNumClients % kAppNumClientMachines == 0, "");
+
+// We don't use postlist, so we don't need a postlist check
+//static_assert(kHrdSQDepth >= 2 * kAppUnsigBatch, "");  // Queue capacity check
+
+hrd_ctrl_blk_t* srm_cb;
+ibv_pd* srm_pd;
+
+struct thread_params_t {
+  size_t id;
+  double* tput;
+  double* tput_Gbps;
+};
+
+DEFINE_uint64(machine_id, std::numeric_limits<size_t>::max(), "Machine ID");
+DEFINE_uint64(is_client, 0, "Is this process a client?");
+DEFINE_uint64(run_time, 0, "Running time");
+DEFINE_uint64(dual_port, 0, "Use two ports?");
+DEFINE_uint64(use_uc, 0, "Use unreliable connected transport?");
+DEFINE_uint64(do_read, 0, "Do RDMA reads?");
+DEFINE_uint64(size, 0, "RDMA size");
+DEFINE_uint64(use_xrc, 0, "Use XRC");
+DEFINE_uint64(test_lat, 0, "Test latency");
+DEFINE_uint64(use_srm, 0, "Test SRM QPs");
+DEFINE_uint64(test_lat_thread, 0, "Test latency thread");
+DEFINE_uint64(use_smart_rc, 0, "use Smart in RC");
+
+std::vector<size_t> traffic_size;
+
+// size_t traffic_size[]={
+//     2, 2, 2, 2, 2, 3, 3, 5, 6, 10,
+//     11, 12, 14, 16, 28, 44, 61, 85, 107, 119,
+//     167, 186, 233, 260, 325, 406, 508, 710, 1109, 96093
+//     };//Facebook_KVstorage
+
+FILE* log_file;
+
+uint64_t seed_array[kAppNumServers + 1];
+
+// 全局变量
+std::mutex barrier_mutex;            // 互斥锁保护
+std::condition_variable barrier_cv;  // 条件变量
+int barrier_count = 0;               // 到达线程墙的线程计数
+// 线程墙实现
+
+// 与内核模块一致的定义
+#define BRIDGE_IOCTL_MAGIC 'B'
+#define REG_TABLE_TO_MLX5 _IOW(BRIDGE_IOCTL_MAGIC, 0x01, struct user_table_info)
+
+#define __cacheline_aligned __attribute__((__aligned__(64)))
+
+#define NUM_SCHED 1
+
+struct xrc_table_entry {
+  uint64_t ctrl;
+  uint64_t tot_bytes;
+  uint64_t tot_recv_cqes;
+
+  uint64_t cur_Gbps;
+  uint64_t cur_lat_us;
+} __cacheline_aligned;  // 对齐到多少字节？
+
+
+
+struct user_table_info {
+  void* table_addr;
+  void* level_table_addr;
+  void* xrc_table_addr;
+
+  size_t level_table_size;
+  size_t table_size;
+  size_t xrc_table_size;
+
+  size_t xrc_qp_num_per_srm;
+};
+#define NUM_LEVEL 2
+#define KERNEL_QP_NUM 16384
+#define HASH_TABLE_KEY_NUM (kAppUnsigBatch * 2)
+#define HASH_TABLE_ENTRY_NUM_PER_BUCKET (kAppUnsigBatch * 2)
+#define HASH_TABLE_ENTRY_NUM HASH_TABLE_KEY_NUM* HASH_TABLE_ENTRY_NUM_PER_BUCKET
+
+#define IDX_TABLE_ENTRY_NUM (kAppUnsigBatch*2)
+#define IDX_TABLE_SIZE \
+  (sizeof(idx_table_entry) *  IDX_TABLE_ENTRY_NUM)  // 表大小（页对齐，4KB=1页）
+#define HASH_TABLE_SIZE (sizeof(hash_table_entry) * HASH_TABLE_ENTRY_NUM)
+
+#define TABLE_SIZE                                                   \
+  (sizeof(uint32_t) * (kAppNumServers + FLAGS_test_lat_thread) * NUM_LEVEL * \
+   NUM_SCHED)  // 表大小（页对齐，4KB=1页）
+#define LEVEL_TABLE_SIZE (sizeof(uint32_t) * NUM_LEVEL * NUM_SCHED)
+
+#define KQP_NUM_PER_THREAD (KERNEL_QP_NUM / kAppNumServers)
+
+
+#define XRC_TABLE_SIZE ((kAppNumServers + FLAGS_test_lat_thread)*(NUM_LEVEL*NUM_SCHED) \
+        *KQP_NUM_PER_THREAD *sizeof(struct xrc_table_entry))
+
+// FNV-1a算法的初始偏移量和质数（针对32位哈希）
+#define FNV1A_INIT 0x811c9dc5UL
+#define FNV1A_PRIME 0x01000193UL
+
+#define DEV_PATH "/dev/mlx5_table_bridge"
+
+const static int golden_step =
+    (int)(HASH_TABLE_KEY_NUM * 0.618 + 0.5) +
+    ((int)(HASH_TABLE_KEY_NUM * 0.618 + 0.5) % 2 == 0);
+
+uint32_t *wqe_table, *level_table;
+
+struct xrc_table_entry (*xrc_table)[NUM_LEVEL*NUM_SCHED][KQP_NUM_PER_THREAD];
+uint64_t xrc_tot_bytes[kAppNumServers + 1][NUM_SCHED][KQP_NUM_PER_THREAD];
+
+int kqp_idx_arr[kAppNumServers + 1][KQP_NUM_PER_THREAD];
+
+#define KQP_WQE_LIMIT 256 //记得要和驱动同步
+int kqp_cnt[kAppNumServers + 1][NUM_SCHED*NUM_LEVEL][KQP_NUM_PER_THREAD]; 
+int free_kqp_cnt[kAppNumServers + 1][NUM_SCHED*NUM_LEVEL];
+int free_kqp_idx[kAppNumServers + 1][NUM_SCHED*NUM_LEVEL][KQP_NUM_PER_THREAD];
+static inline uint64_t rdtsc() {
+  unsigned int lo, hi;
+  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((uint64_t)hi << 32) | lo;
+}
+void thread_barrier() {
+  std::unique_lock<std::mutex> lock(barrier_mutex);
+  barrier_count++;
+  // 通知下一个线程开始执行
+  barrier_cv.notify_all();
+
+  if (barrier_count == kAppNumServers + FLAGS_test_lat_thread) {
+    // 如果所有线程都到达，通知所有线程继续
+    barrier_cv.notify_all();
+  } else {
+    // 否则，当前线程等待
+    barrier_cv.wait(lock, [] {
+      return barrier_count == kAppNumServers + FLAGS_test_lat_thread;
+    });
+  }
+}
+
+void clt_thread_barrier() {
+  std::unique_lock<std::mutex> lock(barrier_mutex);
+  barrier_count++;
+  // 通知下一个线程开始执行
+  barrier_cv.notify_all();
+
+  if (barrier_count == kAppNumClients + FLAGS_test_lat_thread) {
+    // 如果所有线程都到达，通知所有线程继续
+    barrier_cv.notify_all();
+  } else {
+    // 否则，当前线程等待
+    barrier_cv.wait(lock, [] {
+      return barrier_count == kAppNumClients + FLAGS_test_lat_thread;
+    });
+  }
+}
+
+/**
+ * sched_hash_ip - 对IPv4地址进行哈希计算
+ * @addr: 4字节IPv4地址（网络字节序或主机字节序均可，不影响哈希分布）
+ * @n: 哈希表大小（返回值范围为[0, n-1]）
+ * 返回：哈希索引
+ */
+int sched_hash_ip(char addr[4], int n) {
+  if (n <= 0) return 0;  // 避免除零错误（根据实际场景处理）
+
+  uint32_t hash = FNV1A_INIT;
+
+  // 对IP地址的4个字节依次处理（FNV-1a算法）
+  for (int i = 0; i < 4; i++) {
+    hash ^= (uint8_t)addr[i];  // 异或当前字节
+    hash *= FNV1A_PRIME;       // 乘以质数（扩散哈希值）
+  }
+
+  // 确保哈希结果在[0, n-1]范围内（处理n非2的幂的情况）
+  return (int)(hash % (uint32_t)n);
+}
+
+void print_qp_info(struct hrd_qp_attr_t* info) {
+  printf("QP Number: %u\n", info->qpn);
+  printf("GID: ");
+  for (int i = 0; i < 16; ++i) {
+    printf("%02x", info->gid.raw[i]);
+  }
+  printf("\n");
+  printf("r_key: %u\n", info->rkey);
+  printf("addr: %lu\n", info->buf_addr);
+}
+
+std::vector<uint64_t>cpu_cycles;
+void run_server(thread_params_t* params) {
+  size_t srv_gid = params->id;  // Global ID of this server thread
+  size_t ib_port_index = FLAGS_dual_port == 0 ? 0 : srv_gid % 2;
+  int shm_key = kAppBaseSHMKey + static_cast<int>(srv_gid);
+  int clt_num_threads = kAppNumClients / kAppNumClientMachines;  // for xrc only
+
+  hrd_conn_config_t conn_config;
+  conn_config.num_qps =
+      (FLAGS_use_xrc ? kAppNumClientMachines : kAppNumClients);
+  if (srv_gid == kAppNumServers && FLAGS_test_lat_thread) {
+    // lat thread
+    conn_config.num_qps = 1;
+  }
+  conn_config.use_uc = (FLAGS_use_uc == 1);
+  conn_config.prealloc_buf = nullptr;
+  conn_config.buf_size = kAppBufSize;
+  conn_config.buf_shm_key = shm_key;
+  conn_config.use_xrc = (FLAGS_use_xrc == 1);
+  conn_config.is_client = false;
+  conn_config.fst_client_t = false;
+  conn_config.isSmall = srv_gid == kAppNumServers?1:0;
+  // if(FLAGS_use_xrc)
+  //   conn_config.sq_depth = kHrdSQDepth*10;
+
+  hrd_ctrl_blk_t* cb;
+  if (conn_config.use_xrc == 0)
+    cb = hrd_ctrl_blk_init(srv_gid, ib_port_index, 0, &conn_config, nullptr,NULL,NULL);
+  else
+    cb = hrd_ctrl_blk_init_xrc(srv_gid, ib_port_index, 0, &conn_config, nullptr,
+                               0);
+  // Set the buffer to 0 so that we can detect READ completion by polling.
+  memset(const_cast<uint8_t*>(cb->conn_buf), 0, kAppBufSize);
+
+  for (size_t i = 0; i < conn_config.num_qps; i++) {
+    char srv_qp_name[kHrdQPNameSize];
+    size_t clt_id = (cb->conn_config.use_xrc ? i * clt_num_threads : i);
+    if (srv_gid == kAppNumServers && FLAGS_test_lat_thread) {
+      clt_id = kAppNumClients;
+    }
+    sprintf(srv_qp_name, "server-%zu-%zu", srv_gid, clt_id);
+    hrd_publish_conn_qp(cb, i, srv_qp_name);
+  }
+
+  hrd_qp_attr_t* clt_qp[kAppNumClients];
+  if (srv_gid == kAppNumServers) {
+    char clt_qp_name[kHrdQPNameSize];
+    sprintf(clt_qp_name, "client-%zu-%zu", kAppNumClients, srv_gid);
+
+    clt_qp[0] = nullptr;
+    while (clt_qp[0] == nullptr) {
+      clt_qp[0] = hrd_get_published_qp(clt_qp_name);
+      if (clt_qp[0] == nullptr) usleep(20000);
+    }
+
+    // printf("main: Server %zu found client %zu! Connecting..\n", srv_gid,
+    //        kAppNumClients);
+    hrd_connect_qp(cb, 0, clt_qp[0]);
+    hrd_wait_till_ready(clt_qp_name);
+
+    print_qp_info(clt_qp[0]);
+  } else {
+    for (size_t i = 0; i < kAppNumClients; i++) {
+      char clt_qp_name[kHrdQPNameSize];
+      sprintf(clt_qp_name, "client-%zu-%zu", i, srv_gid);
+
+      clt_qp[i] = nullptr;
+      while (clt_qp[i] == nullptr) {
+        clt_qp[i] = hrd_get_published_qp(clt_qp_name);
+        if (clt_qp[i] == nullptr) usleep(20000);
+      }
+
+      if (!cb->conn_config.use_xrc || i % clt_num_threads == 0) {
+        printf("main: Server %zu found client %zu! Connecting..\n", srv_gid, i);
+        hrd_connect_qp(cb, i, clt_qp[i]);
+        hrd_wait_till_ready(clt_qp_name);
+      }
+      print_qp_info(clt_qp[i]);
+    }
+  }
+
+  printf("main: Server %zu ready\n", srv_gid);
+
+// 注册本线程所有要轮询的CQ，供SMART在积分不足时轮询多个CQ
+  std::vector<size_t> nxt_poll_num(cb->conn_config.num_qps, kAppUnsigBatch);
+  if (!FLAGS_use_srm && FLAGS_use_smart_rc) {
+    for (size_t i = 0; i < cb->conn_config.num_qps; ++i) {
+      smartshim::register_cq(cb->conn_cq[i]);
+      smartshim::register_next_poll_table(nxt_poll_num.data(), cb->conn_config.num_qps);
+    }
+  }
+
+  struct ibv_send_wr wr, *bad_send_wr;
+  struct ibv_sge sgl;
+  // struct ibv_wc wc_lat;
+  struct ibv_wc wc[kAppUnsigBatch];
+  size_t rolling_iter = 0;             // For performance measurement
+  size_t nb_tx[kAppNumClients] = {0};  // Per-QP signaling
+  size_t nb_tx_tot = 0;                // For windowing (for READs only)
+  struct timespec run_start, run_end;
+  struct timespec msr_start, msr_end;
+  struct timespec lat_start, lat_end;
+  clock_gettime(CLOCK_REALTIME, &run_start);
+  clock_gettime(CLOCK_REALTIME, &msr_start);
+  std::vector<double> lats;
+
+  auto opcode = FLAGS_do_read == 0 ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
+  uint64_t seed = 0xdeadbeef;
+  size_t cn, qp_cn;
+  cn = qp_cn = -1;
+  int real_sz;
+  double tot_sz = 0;
+
+  uint64_t lat_st, lat_ed;
+  double elapsed_cycles, elapsed_time_us;
+  thread_barrier();
+
+  while (1) {
+    if (srv_gid != kAppNumServers) {
+      if (rolling_iter >= KB(128)) {
+        clock_gettime(CLOCK_REALTIME, &msr_end);
+        double msr_seconds =
+            (msr_end.tv_sec - msr_start.tv_sec) +
+            (msr_end.tv_nsec - msr_start.tv_nsec) / 1000000000.0;
+        double tput = rolling_iter / msr_seconds;
+        double tput_Gbps = tot_sz / msr_seconds / 1e9 * 8;
+
+        clock_gettime(CLOCK_REALTIME, &run_end);
+        double run_seconds =
+            (run_end.tv_sec - run_start.tv_sec) +
+            (run_end.tv_nsec - run_start.tv_nsec) / 1000000000.0;
+        if (run_seconds >= FLAGS_run_time) {
+          printf("main: Server %zu exiting.\n", srv_gid);
+          hrd_ctrl_blk_destroy(cb);
+          return;
+        }
+
+        printf(
+            "main: Server %zu: %.2f ops, %.2f Gbps. Total active QPs = %zu. "
+            "Outstanding ops per thread (for READs) = %zu. "
+            "Seconds = %.1f of %zu.\n",
+            srv_gid, tput, tput_Gbps, kAppNumServers * kAppNumClients,
+            kAppWindowSize, run_seconds, FLAGS_run_time);
+
+        params->tput[srv_gid] = tput;
+        params->tput_Gbps[srv_gid] = tput_Gbps;
+        if (srv_gid == 0) {
+          double tot = 0, tot_Gbps = 0;
+          for (size_t i = 0; i < kAppNumServers; i++) {
+            tot += params->tput[i];
+            tot_Gbps += params->tput_Gbps[i];
+          }
+          hrd_red_printf("Total tput = %.2f ops,%.2f Gbps\n", tot, tot_Gbps);
+        }
+
+        rolling_iter = 0;
+        tot_sz = 0;
+        clock_gettime(CLOCK_REALTIME, &msr_start);
+        if (FLAGS_test_lat) {
+          double avg =
+              std::accumulate(lats.begin(), lats.end(), 0.0) / lats.size();
+          sort(lats.begin(), lats.end());
+          printf(
+              "Latency(us): min = %.2f, max = %.2f, avg = %.2f, median = %.2f, "
+              "99th = %.2f\n",
+              lats[0], lats[lats.size() - 1], avg, lats[lats.size() / 2],
+              lats[lats.size() * 99 / 100]);
+          lats.clear();
+        }
+      }
+      size_t window_i =
+          nb_tx_tot % kAppWindowSize;  // Current window slot to use
+
+      // For READs, restrict outstanding ops per-thread to kAppWindowSize
+      if (opcode == IBV_WR_RDMA_READ && nb_tx_tot >= kAppWindowSize) {
+        while (cb->conn_buf[window_i * FLAGS_size] == 0) {
+          // Wait for a window slow to open up
+        }
+        cb->conn_buf[window_i * FLAGS_size] = 0;
+      }
+
+      // Choose the next client to send a packet to
+      size_t cn = (hrd_fastrand(&seed)) % kAppNumClients;
+      // cn = (cn + 1) % kAppNumClients;
+      qp_cn = cb->conn_config.use_xrc ? cn / clt_num_threads : cn;
+      wr.opcode = opcode;
+      wr.num_sge = 1;
+      wr.next = nullptr;
+      wr.sg_list = &sgl;
+
+      // wr.send_flags = nb_tx[qp_cn] % kAppUnsigBatch == 0 ? IBV_SEND_SIGNALED : 0;
+      // if (!FLAGS_use_srm && FLAGS_use_smart_rc) wr.send_flags = IBV_SEND_SIGNALED;
+      // else if(!FLAGS_use_srm && !FLAGS_use_smart_rc)
+        // wr.send_flags = (nb_tx[qp_cn] % kAppUnsigBatch == 0) ? IBV_SEND_SIGNALED : 0;
+      wr.send_flags = IBV_SEND_SIGNALED;
+      // if (nb_tx[qp_cn] % kAppUnsigBatch == 0 && nb_tx[qp_cn] > 0 &&
+      //     !FLAGS_test_lat) {
+      //   int ret=0;
+      //   if (!FLAGS_use_srm && FLAGS_use_smart_rc) {
+      //     // 若刚在 before_post_send 中从该CQ拿过CQE，则跳过busy-wait并复位标志
+      //       // printf("before hrd_poll_cq_ret1 \n");
+      //       // ret = hrd_poll_cq_ret(cb->conn_cq[qp_cn], kAppUnsigBatch, wc);
+      //       ret = ibv_poll_cq(cb->conn_cq[qp_cn], kAppUnsigBatch, wc);
+      //       smartshim::clear_cq_flag(cb->conn_cq[qp_cn]);
+      //       if (ret > 0) smartshim::on_cq_completions(ret);
+          
+      //   } 
+      //   // else {
+      //   //   // This can happen if a client dies before the server
+      //   //   // ret = hrd_poll_cq_ret(cb->conn_cq[qp_cn], 1, wc);
+      //   //   ret = ibv_poll_cq(cb->conn_cq[qp_cn], kAppUnsigBatch, wc);
+      //   // }
+      //   if (ret == -1) {
+      //     hrd_ctrl_blk_destroy(cb);
+      //     return;
+      //   }
+      // }
+      if (!FLAGS_use_srm && !FLAGS_use_smart_rc && !FLAGS_test_lat) {
+        while (nb_tx[qp_cn] >= nxt_poll_num[qp_cn] && nb_tx[qp_cn] > 0) {
+          int got = ibv_poll_cq(cb->conn_cq[qp_cn], (int)kAppUnsigBatch, wc);
+          if (got < 0) {
+            // 处理错误：可以直接退出或打印
+            fprintf(stderr, "ibv_poll_cq error on qp %zu: %d\n", qp_cn, got);
+            hrd_ctrl_blk_destroy(cb);
+            return;
+          }
+          else if (got > 0) {
+            // 允许的发送阈值前移 got：下一次最多再发 got 个
+            nxt_poll_num[qp_cn] += (size_t)got;
+            break;  // 已获得预算，退出等待，继续 post send
+          }
+        }
+       
+    }else if (!FLAGS_use_srm && FLAGS_use_smart_rc && !FLAGS_test_lat) { 
+       while (nb_tx[qp_cn] >= nxt_poll_num[qp_cn] && nb_tx[qp_cn] > 0) {
+          int got = ibv_poll_cq(cb->conn_cq[qp_cn], (int)kAppUnsigBatch, wc);
+          if (got < 0) {
+            // 处理错误：可以直接退出或打印
+            fprintf(stderr, "ibv_poll_cq error on qp %zu: %d\n", qp_cn, got);
+            hrd_ctrl_blk_destroy(cb);
+            return;
+          }
+          else if (got > 0) {
+            // 允许的发送阈值前移 got：下一次最多再发 got 个
+            nxt_poll_num[qp_cn] += (size_t)got;
+            smartshim::clear_cq_flag(cb->conn_cq[qp_cn]);
+            smartshim::on_cq_completions(got);
+            break;  // 已获得预算，退出等待，继续 post send
+          }
+
+       }
+
+
+    }
+
+      // wr.send_flags |= (FLAGS_do_read == 0) ? IBV_SEND_INLINE : 0;
+      //real_sz = traffic_size[hrd_fastrand(&seed) % traffic_size.size()];
+      // Match ib_write_bw -s 1000000 by using FLAGS_size as the message size
+      real_sz = KB(10);
+      tot_sz += real_sz;
+
+      sgl.addr =
+          reinterpret_cast<uint64_t>(&cb->conn_buf[window_i * FLAGS_size]);
+      sgl.length = real_sz;
+      sgl.lkey = cb->conn_buf_mr->lkey;
+
+      // size_t remote_offset = hrd_fastrand(&seed) % (kAppBufSize -
+      // FLAGS_size);
+      size_t remote_offset = 0;
+      wr.wr.rdma.remote_addr = clt_qp[cn]->buf_addr + remote_offset;
+      wr.wr.rdma.rkey = clt_qp[cn]->rkey;
+      // wr.wr.rdma.remote_addr = 0;
+      // wr.wr.rdma.rkey = 0;
+      wr.qp_type.xrc.remote_srqn = clt_qp[cn]->srqn;
+      nb_tx[qp_cn]++;
+      if (FLAGS_test_lat) {
+        clock_gettime(CLOCK_REALTIME, &lat_start);
+      }
+      // if(srv_gid == 0){
+      //   lat_st = rdtsc();
+      // }
+      if(!FLAGS_use_srm && FLAGS_use_smart_rc){
+        int ret_smart = smartshim::before_post_send(1, cb->conn_cq[qp_cn], wc, kAppUnsigBatch);
+      }
+      
+
+      int ret = ibv_post_send(cb->conn_qp[qp_cn], &wr, &bad_send_wr);
+      // if(srv_gid == 0){
+      //   lat_ed = rdtsc();
+      //   cpu_cycles.push_back(lat_ed - lat_st);
+      //   if(cpu_cycles.size()>=5000000){
+      //        uint64_t avg_cpu_cycles = std::accumulate(cpu_cycles.begin(),cpu_cycles.end(),0LL)/cpu_cycles.size(); 
+      //        fprintf(log_file,"avg_cpu_cycles %llu\n", avg_cpu_cycles);
+      //        fflush(log_file);
+      //        cpu_cycles.clear();
+      //   }
+      // }
+      rt_assert(ret == 0);
+      rolling_iter++;
+      if (FLAGS_test_lat) {
+        int ret = hrd_poll_cq_ret(cb->conn_cq[qp_cn], 1, wc);
+        if (ret == -1) {
+          hrd_ctrl_blk_destroy(cb);
+          return;
+        }
+        clock_gettime(CLOCK_REALTIME, &lat_end);
+        double lat_sec = (lat_end.tv_sec - lat_start.tv_sec) * 1e6 +
+                         (lat_end.tv_nsec - lat_start.tv_nsec) / 1e3;
+        lats.push_back(lat_sec);
+      }
+    } else {
+      if (rolling_iter >= KB(128)) {
+        double avg =
+            std::accumulate(lats.begin(), lats.end(), 0.0) / lats.size();
+        sort(lats.begin(), lats.end());
+        printf(
+            "Latency(us): min = %.2f, max = %.2f, avg = %.2f, median = %.2f, "
+            "99th = %.2f\n",
+            lats[0], lats[lats.size() - 1], avg, lats[lats.size() / 2],
+            lats[lats.size() * 99 / 100]);
+        lats.clear();
+
+        rolling_iter = 0;
+      }
+      size_t window_i =
+          nb_tx_tot % kAppWindowSize;  // Current window slot to use
+
+      // For READs, restrict outstanding ops per-thread to kAppWindowSize
+      if (opcode == IBV_WR_RDMA_READ && nb_tx_tot >= kAppWindowSize) {
+        while (cb->conn_buf[window_i * FLAGS_size] == 0) {
+          // Wait for a window slow to open up
+        }
+        cb->conn_buf[window_i * FLAGS_size] = 0;
+      }
+
+      // Choose the next client to send a packet to
+      // size_t cn = (hrd_fastrand(&seed)) % kAppNumClients;
+      cn = 0;
+      qp_cn = cn;
+      wr.opcode = opcode;
+      wr.num_sge = 1;
+      wr.next = nullptr;
+      wr.sg_list = &sgl;
+
+      wr.send_flags = IBV_SEND_SIGNALED;
+
+      // wr.send_flags |= (FLAGS_do_read == 0) ? IBV_SEND_INLINE : 0;
+      real_sz = KB(1);
+
+      sgl.addr =
+          reinterpret_cast<uint64_t>(&cb->conn_buf[window_i * FLAGS_size]);
+      sgl.length = real_sz;
+      sgl.lkey = cb->conn_buf_mr->lkey;
+
+      // size_t remote_offset = hrd_fastrand(&seed) % (kAppBufSize -
+      // FLAGS_size);
+      size_t remote_offset = 0;
+      wr.wr.rdma.remote_addr = clt_qp[cn]->buf_addr + remote_offset;
+      wr.wr.rdma.rkey = clt_qp[cn]->rkey;
+      // wr.wr.rdma.remote_addr = 0;
+      // wr.wr.rdma.rkey = 0;
+      // wr.qp_type.xrc.remote_srqn = clt_qp[cn]->srqn;
+      nb_tx[qp_cn]++;
+
+      lat_st = rdtsc();
+
+      int ret = ibv_post_send(cb->conn_qp[qp_cn], &wr, &bad_send_wr);
+
+      rt_assert(ret == 0);
+      rolling_iter++;
+      ret = hrd_poll_cq_ret(cb->conn_cq[qp_cn], 1, wc);
+      if (ret == -1) {
+        hrd_ctrl_blk_destroy(cb);
+        return;
+      }
+
+      lat_ed = rdtsc();
+      if (sgl.length <= KB(10)) {
+        elapsed_cycles = (double)(lat_ed - lat_st);
+        elapsed_time_us = (elapsed_cycles / CPU_FREQUENCY_HZ) * 1000000.0;
+        lats.push_back(elapsed_time_us);
+      }
+    }
+  }
+}
+int hash_next_key(int hash_val, int i, int sz) {
+  return (hash_val + i * golden_step) & (sz - 1);
+}
+
+static inline int get_free_qp_idx(int srv_gid, int srm_idx, uint64_t* seed){
+  if(free_kqp_cnt[srv_gid][srm_idx] == 0){
+    printf("Error: no free kqp idx!\n");
+    return -1;
+  }
+  int pos_idx = hrd_fastrand(seed) % free_kqp_cnt[srv_gid][srm_idx];
+  int kqp_idx = free_kqp_idx[srv_gid][srm_idx][pos_idx];
+  kqp_cnt[srv_gid][srm_idx][kqp_idx]++;
+  if(kqp_cnt[srv_gid][srm_idx][kqp_idx] == KQP_WQE_LIMIT){
+    //移除该idx
+    free_kqp_cnt[srv_gid][srm_idx]--;
+    free_kqp_idx[srv_gid][srm_idx][pos_idx] = free_kqp_idx[srv_gid][srm_idx][free_kqp_cnt[srv_gid][srm_idx]];
+    //printf("should not exits\n");
+  }
+  return kqp_idx;
+}
+static inline void put_free_qp_idx(int srv_gid,int srm_idx, int kqp_idx){
+  if(kqp_cnt[srv_gid][srm_idx][kqp_idx] == KQP_WQE_LIMIT){
+    //加入该idx
+    free_kqp_idx[srv_gid][srm_idx][free_kqp_cnt[srv_gid][srm_idx]] = kqp_idx;
+    free_kqp_cnt[srv_gid][srm_idx]++;
+  }
+  kqp_cnt[srv_gid][srm_idx][kqp_idx]--;
+}
+
+void run_client(thread_params_t* params) {
+  printf("run_client\n");
+  struct sched_param param;
+  int policy;
+  pthread_getschedparam(pthread_self(), &policy, &param);
+
+  int o_pri = param.sched_priority;
+
+  param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+  pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+
+  size_t num_threads =
+      kAppNumClients / kAppNumClientMachines + (FLAGS_test_lat_thread);
+
+  size_t clt_gid = params->id;  // Global ID of this server thread
+  size_t ib_port_index = FLAGS_dual_port == 0 ? 0 : clt_gid % 2;
+  int shm_key = kAppBaseSHMKey + clt_gid % num_threads;
+
+  hrd_conn_config_t conn_config;
+  {
+    // 等待逻辑：确保按 clt_gid 顺序启动客户端线程
+    std::unique_lock<std::mutex> lock(barrier_mutex);
+    // 等待条件满足（等待时会释放锁，被唤醒后重新获取锁）
+    barrier_cv.wait(lock, [&]() { return barrier_count == clt_gid; });
+  }
+
+  // xrcd fd
+  conn_config.xrcd_fd =
+      open(SERVER_XRCD_FILE_PATH, O_RDONLY | O_CREAT, S_IRUSR | S_IRGRP);
+  conn_config.use_uc = (FLAGS_use_uc == 1);
+  conn_config.prealloc_buf = nullptr;
+  conn_config.buf_size = kAppBufSize;
+  conn_config.buf_shm_key = shm_key;
+  conn_config.is_client = true;
+  conn_config.fst_client_t = (clt_gid % num_threads == 0);
+  conn_config.use_xrc = (FLAGS_use_xrc == 1);
+  conn_config.num_qps =
+      (!FLAGS_use_xrc || conn_config.fst_client_t ? kAppNumServers : 0);
+  conn_config.rnum_threads = kAppNumServers;
+  if (clt_gid == kAppNumClients) {
+    conn_config.num_qps = 1;
+    conn_config.rnum_threads = 1;
+  }
+
+  bool fst_client_t = conn_config.fst_client_t;
+  hrd_ctrl_blk_t* cb;
+ 
+  if (clt_gid == 0) {
+    srm_cb = new hrd_ctrl_blk_t();
+    memset(srm_cb, 0, sizeof(hrd_ctrl_blk_t));
+    hrd_resolve_port_index(srm_cb, 0);
+    srm_pd = ibv_alloc_pd(srm_cb->resolve.ib_ctx);
+  }
+  if (conn_config.use_xrc)
+    cb = hrd_ctrl_blk_init_xrc(clt_gid, ib_port_index, 0, &conn_config, nullptr,
+                               fst_client_t);
+  else
+    cb = hrd_ctrl_blk_init(clt_gid, ib_port_index, 0, &conn_config, nullptr,srm_cb,srm_pd);
+  // Set to some non-zero value so the server can detect READ completion
+  memset(const_cast<uint8_t*>(cb->conn_buf), 1, kAppBufSize);
+
+  if (clt_gid != kAppNumClients) {
+    for (size_t i = 0; i < kAppNumServers; i++) {
+      char clt_qp_name[kHrdQPNameSize];
+      sprintf(clt_qp_name, "client-%zu-%zu", clt_gid, i);
+      hrd_publish_conn_qp(cb, i, clt_qp_name);
+    }
+    if (!cb->conn_config.use_xrc || fst_client_t) {
+      for (size_t i = 0; i < kAppNumServers; i++) {
+        char srv_qp_name[kHrdQPNameSize];
+        sprintf(srv_qp_name, "server-%zu-%zu", i, clt_gid);
+
+        hrd_qp_attr_t* srv_qp = nullptr;
+        while (srv_qp == nullptr) {
+          srv_qp = hrd_get_published_qp(srv_qp_name);
+          if (srv_qp == nullptr) usleep(20000);
+        }
+
+        printf("main: Client %zu found server %zu! Connecting..\n", clt_gid, i);
+        hrd_connect_qp(cb, i, srv_qp);
+
+        char clt_qp_name[kHrdQPNameSize];
+        sprintf(clt_qp_name, "client-%zu-%zu", clt_gid, i);
+        hrd_publish_ready(clt_qp_name);
+        print_qp_info(srv_qp);
+      }
+    }
+  } else {
+    for (size_t i = 0; i < 1; i++) {
+      char clt_qp_name[kHrdQPNameSize];
+      sprintf(clt_qp_name, "client-%zu-%zu", clt_gid, kAppNumServers);
+      hrd_publish_conn_qp(cb, i, clt_qp_name);
+    }
+    if (!cb->conn_config.use_xrc || fst_client_t) {
+      for (size_t i = 0; i < 1; i++) {
+        char srv_qp_name[kHrdQPNameSize];
+        sprintf(srv_qp_name, "server-%zu-%zu", kAppNumServers, clt_gid);
+
+        hrd_qp_attr_t* srv_qp = nullptr;
+        while (srv_qp == nullptr) {
+          srv_qp = hrd_get_published_qp(srv_qp_name);
+          if (srv_qp == nullptr) usleep(20000);
+        }
+
+        printf("main: Client %zu found server %zu! Connecting..\n", clt_gid,
+               kAppNumServers);
+        hrd_connect_qp(cb, i, srv_qp);
+
+        char clt_qp_name[kHrdQPNameSize];
+        sprintf(clt_qp_name, "client-%zu-%zu", clt_gid, kAppNumServers);
+        hrd_publish_ready(clt_qp_name);
+        print_qp_info(srv_qp);
+      }
+    }
+  }
+  printf("main: Client %zu READY\n", clt_gid);
+
+  clt_thread_barrier();
+
+  param.sched_priority = o_pri;
+  pthread_setschedparam(pthread_self(), policy, &param);
+
+  struct timespec run_start, run_end;
+  clock_gettime(CLOCK_REALTIME, &run_start);
+
+  while (true) {
+    printf("main: Client %zu: %d\n", clt_gid, cb->conn_buf[0]);
+
+    clock_gettime(CLOCK_REALTIME, &run_end);
+    double run_seconds = (run_end.tv_sec - run_start.tv_sec) +
+                         (run_end.tv_nsec - run_start.tv_nsec) / 1000000000.0;
+
+    if (run_seconds >= FLAGS_run_time + kAppRunTimeSlack) {
+      printf("main: Client %zu: exiting\n", clt_gid);
+      hrd_ctrl_blk_destroy(cb);
+      return;
+    } else {
+      printf("main: Client %zu: active for %.2f seconds (of %zu + %zu)\n",
+             clt_gid, run_seconds, FLAGS_run_time, kAppRunTimeSlack);
+    }
+
+    sleep(1);
+  }
+}
+
+
+void set_thread_priority(std::thread& t) {
+  // 获取线程的原生句柄
+  pthread_t native_handle = t.native_handle();
+
+  // 定义调度参数
+  struct sched_param param;
+  int policy = SCHED_FIFO;
+
+  // 获取最大优先级
+  int max_priority = sched_get_priority_max(policy);
+  param.sched_priority = max_priority;
+
+  // 设置调度策略和优先级
+  if (pthread_setschedparam(native_handle, policy, &param) != 0) {
+    std::cerr << "Failed to set thread priority: " << strerror(errno)
+              << std::endl;
+  }
+}
+
+// 生成随机种子数组
+static void generate_random_seeds(uint64_t* seed_array, size_t count) {
+  // 选择初始种子（从之前的推荐中选取）
+  uint64_t initial_seed = 0xdeadbeefdeadbeef;
+  uint64_t current_seed = initial_seed;
+
+  for (size_t i = 0; i < count; i++) {
+    // 生成64位种子：高32位 + 低32位，各调用一次随机函数
+    uint32_t high = hrd_fastrand(&current_seed);
+    uint32_t low = hrd_fastrand(&current_seed);
+    seed_array[i] = ((uint64_t)high << 32) | low;
+  }
+}
+int main(int argc, char* argv[]) {
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  rt_assert(FLAGS_dual_port <= 1, "Invalid dual_port");
+  rt_assert(FLAGS_use_uc <= 1, "Invalid use_uc");
+  rt_assert(FLAGS_is_client <= 1, "Invalid is_client");
+  rt_assert(kAppNumClients % kAppNumClientMachines == 0,
+            "NumClients must can be div by NumMachines");
+  if(!FLAGS_use_srm && FLAGS_use_smart_rc){    
+    smartshim::Config cfg;
+    smartshim::init(cfg);//参数来源于smart.h
+    smartshim::start_tuner();
+  
+  }
+  int fd, ret;
+  if(!FLAGS_is_client){
+    // 初始化wqe表
+    std::ifstream infile("Twitter-cluster12_traffic_size.txt");
+    // std::ifstream infile("Twitter-cluster12_traffic_size.txt");
+    int val;
+    while (infile >> val) {
+      traffic_size.push_back(val);
+    }
+    printf("traffic_size size:%d\n,traffic_size[0]:%d\n", traffic_size.size(),
+          traffic_size[0]);
+
+    if(FLAGS_use_srm){
+      // mmap表
+      
+      struct user_table_info info;
+
+      // 1. 分配页对齐的用户态内存（表）
+      void* table =
+          mmap(NULL, TABLE_SIZE, PROT_READ | PROT_WRITE,
+              MAP_ANONYMOUS | MAP_SHARED | MAP_LOCKED,  // 锁定内存不被换出
+              -1, 0);
+      if (table == MAP_FAILED) {
+        perror("wqe table mmap失败");
+        return -1;
+      }
+
+      void* l_table =
+          mmap(NULL, LEVEL_TABLE_SIZE, PROT_READ | PROT_WRITE,
+              MAP_ANONYMOUS | MAP_SHARED | MAP_LOCKED,  // 锁定内存不被换出
+              -1, 0);
+      if (l_table == MAP_FAILED) {
+        perror("level table mmap失败");
+        munmap(table, TABLE_SIZE);
+        return -1;
+      }
+
+      void * x_table = 
+          mmap(NULL, XRC_TABLE_SIZE, PROT_READ | PROT_WRITE,
+              MAP_ANONYMOUS | MAP_SHARED | MAP_LOCKED,  // 锁定内存不被换出
+              -1, 0);
+      if(x_table == MAP_FAILED){
+        perror("xrc table mmap失败");
+        return -1;
+      }
+
+      // 2. 初始化表数据
+      wqe_table = (uint32_t*)table;
+      for (int i = 0; i < TABLE_SIZE / sizeof(uint32_t); i++) {
+        wqe_table[i] = 0;
+      }
+
+      level_table = (uint32_t*)l_table;
+      for (int i = 0; i < LEVEL_TABLE_SIZE / sizeof(uint32_t); i++) {
+        level_table[i] = 0;
+      }
+
+      xrc_table = (xrc_table_entry (*)[NUM_LEVEL*NUM_SCHED][KQP_NUM_PER_THREAD])x_table;
+
+      for(int i= 0;i<(kAppNumServers + FLAGS_test_lat_thread);i++){
+        for(int j=0;j<NUM_LEVEL*NUM_SCHED;j++){
+          for(int k=0;k<KQP_NUM_PER_THREAD;k++){
+            xrc_table[i][j][k].ctrl = 0;
+            xrc_table[i][j][k].tot_bytes = 0;
+          }
+        }
+      }
+
+      info.table_addr = table;
+      info.table_size = TABLE_SIZE;
+      info.level_table_addr = l_table;
+      info.level_table_size = LEVEL_TABLE_SIZE;
+
+      info.xrc_table_addr = x_table;
+      info.xrc_table_size = XRC_TABLE_SIZE;
+      info.xrc_qp_num_per_srm = KQP_NUM_PER_THREAD;
+
+
+
+
+
+
+
+
+      // 3. 打开内核设备
+      fd = open(DEV_PATH, O_RDWR);
+      if (fd < 0) {
+        perror("打开设备失败");
+        munmap(table, TABLE_SIZE);
+        munmap(l_table, LEVEL_TABLE_SIZE);
+        return -1;
+      }
+
+      // 4. 通过ioctl传递表信息给内核
+      ret = ioctl(fd, REG_TABLE_TO_MLX5, &info);
+      if (ret < 0) {
+        perror("ioctl失败");
+        close(fd);
+        munmap(table, TABLE_SIZE);
+        munmap(l_table, LEVEL_TABLE_SIZE);
+        return -1;
+      }
+
+      // 初始化kqp_idx_arr表
+      memset(kqp_idx_arr, -1, sizeof(kqp_idx_arr));
+
+
+    }
+    // 初始化随机数种子数组
+    generate_random_seeds(seed_array, kAppNumServers + 1);
+
+
+    for(int i=0;i<(kAppNumServers + FLAGS_test_lat_thread);i++){
+      for(int j =0;j<NUM_LEVEL*NUM_SCHED;j++){
+        free_kqp_cnt[i][j] = KQP_NUM_PER_THREAD;
+        for(int k =0;k<KQP_NUM_PER_THREAD;k++){
+          free_kqp_idx[i][j][k] = k;
+        }
+      }
+    }
+  }
+  // char filename[64] ;
+  // sprintf(filename, "log_FCScale_ps.txt");
+  // log_file = fopen(filename, "w");
+  // if(log_file == NULL){
+  //   perror("fopen失败");
+  //   return -1;
+  // }
+
+  size_t num_threads;
+  if (FLAGS_is_client == 1) {
+    num_threads = kAppNumClients / kAppNumClientMachines;
+  } else {
+    // All the buffers sent or received should fit in @conn_buf
+    // rt_assert(FLAGS_size * kAppWindowSize < kAppBufSize, "");
+
+    num_threads = kAppNumServers;
+    rt_assert(FLAGS_machine_id == std::numeric_limits<size_t>::max(), "");
+    rt_assert(FLAGS_size > 0, "Invalid size");
+
+    // if (FLAGS_do_read == 0) rt_assert(FLAGS_size <= kHrdMaxInline, "Inl
+    // error");//now not inline
+    rt_assert(FLAGS_do_read <= 1, "Invalid do_read");
+  }
+  if (FLAGS_test_lat_thread) num_threads++;
+
+  // Launch the server or client threads
+  printf("main: Launching %zu threads\n", num_threads);
+  std::vector<thread_params_t> param_arr(num_threads);
+  std::vector<std::thread> thread_arr(num_threads);
+  // auto* tput = new double[num_threads];
+  double tput[num_threads], tput_Gbps[num_threads];
+
+  // if (FLAGS_use_srm && !FLAGS_is_client) {
+  //   srm_cb = new hrd_ctrl_blk_t();
+  //   memset(srm_cb, 0, sizeof(hrd_ctrl_blk_t));
+  //   hrd_resolve_port_index(srm_cb, 0);
+  //   srm_pd = ibv_alloc_pd(srm_cb->resolve.ib_ctx);
+  // }
+  for (size_t i = 0; i < num_threads; i++) {
+    if (FLAGS_is_client == 1) {
+      param_arr[i].id = (FLAGS_machine_id * num_threads) + i;
+      if (!FLAGS_use_srm)
+        thread_arr[i] = std::thread(run_client, &param_arr[i]);
+      // if(FLAGS_use_xrc && i==0)
+      //   set_thread_priority(thread_arr[i]);
+    } else {
+      param_arr[i].id = i;
+      param_arr[i].tput = tput;
+      param_arr[i].tput_Gbps = tput_Gbps;
+      if (!FLAGS_use_srm)
+        thread_arr[i] = std::thread(run_server, &param_arr[i]);
+
+    }
+  }
+
+  for (auto& t : thread_arr) t.join();
+  // if (FLAGS_use_srm) {
+  //   ibv_dealloc_pd(srm_pd);
+  //   ibv_close_device(srm_cb->resolve.ib_ctx);
+  // }
+  if(!FLAGS_use_srm && FLAGS_use_smart_rc){
+    smartshim::stop_tuner();
+  }
+  
+
+  if(!FLAGS_is_client && FLAGS_use_srm){
+    // 关闭内核设备
+    close(fd);
+  }
+  //fclose(log_file);
+  return 0;
+}
