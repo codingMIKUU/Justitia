@@ -1,5 +1,5 @@
 #include "monitor.h"
-#include "pingpong.h"ASZ
+#include "pingpong.h"
 #include "get_clock.h"
 #include "pacer.h"
 #include "countmin.h"
@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <string.h>
 
-#define TAIL 2
+#define TAIL 2 
 
 #define EVENT_POLL 0    // use event-triggered polling (or busy polling) for reference flow
 #define CS_OFFSET 4     // context switch offset

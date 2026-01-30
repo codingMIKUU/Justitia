@@ -48,7 +48,6 @@
 #include "bitmap.h"
 #include "implicit_lkey.h"
 #include "wqe.h"
-
 ////
 #include <inttypes.h>
 #define SPLIT_CHUNK_SIZE		1000000			//// Default Split Chunk Size; Need to be equal or less than the initial chunk size that pacer sets.
@@ -66,9 +65,9 @@
 //#define SPLIT_QP_NUM_ONE_SIDED			2		//// Default number of split_QPs used to send split chunks in one-sided verbs
 #define MAX_SPLIT_QP_NUM_ONE_SIDED		1	    //// Maximum number of split_QPs used to send split chunks in one-sided verbs
 #define SPLIT_MAX_SEND_WR 	    22
-#define SPLIT_MAX_RECV_WR 		100
-#define SPLIT_MAX_CQE			100
-#define RR_BUFFER_INIT_CAP		1000
+#define SPLIT_MAX_RECV_WR 		1
+#define SPLIT_MAX_CQE			1
+#define RR_BUFFER_INIT_CAP		1
 //#define CPU_FRIENDLY                            //// Don't not use busy-wait checking for "pending" in shared memory. Use UDS with token enforcement.
 #define SPLIT_BIG_CHUNK_SIZE    1000000	        //// The big chunk size used in CPU_FRIENDLY version. Should be consistent with the value used in Pacer.
 //#define SPLIT_BIG_CHUNK_SIZE    10485760	        //// The big chunk size used in CPU_FRIENDLY version. Should be consistent with the value used in Pacer.

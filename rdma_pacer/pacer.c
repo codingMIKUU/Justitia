@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "pacer.h"
 #include "monitor.h"
 #include "get_clock.h"
@@ -10,7 +14,8 @@
 //#define DEFAULT_CHUNK_SIZE 10000000
 #define DEFAULT_CHUNK_SIZE 1000000
 //#define DEFAULT_CHUNK_SIZE 1048576
-#define SMALL_CHUNK_SIZE 5000
+#define SMALL_CHUNK_SIZE 20000
+
 //#define SMALL_CHUNK_SIZE 5120
 //#define EVEN_SMALLER_CHUNK_SIZE 1000
 //#define EVEN_SMALLER_CHUNK_SIZE 1024
@@ -537,6 +542,17 @@ static void generate_fetch_tokens()
     int next_idx = 0;
     // struct timespec wait_time;
 
+    /*
+     * Optional CPU-cycle profiling for token generation/grant.
+     * Enable with: PACER_MEASURE_TOKEN_CYCLES=1
+     */
+    const char *measure_env = getenv("PACER_MEASURE_TOKEN_CYCLES");
+    const int measure_token_cycles = (measure_env && measure_env[0] == '1');
+    const uint64_t report_every = 1000000ULL;
+    uint64_t token_gen_cnt = 0, token_gen_total_cycles = 0;
+    uint64_t token_gen_spin_cycles = 0, token_gen_issue_cycles = 0;
+    uint64_t token_grant_cnt = 0, token_grant_cycles = 0;
+
     /* infinite loop: generate tokens at a rate calculated 
      * from virtual_link_cap and active chunk size 
      */
@@ -611,6 +627,10 @@ static void generate_fetch_tokens()
             while (1) {
                 if (!__atomic_load_n(&cb.sb->flows[i].read, __ATOMIC_RELAXED) && __atomic_load_n(&cb.sb->flows[i].pending, __ATOMIC_RELAXED)) {
                     if (try_fetch_a_token()) {
+                        cycles_t grant_st = 0, grant_ed = 0;
+                        if (measure_token_cycles)
+                            grant_st = get_cycles();
+
                         __atomic_store_n(&cb.sb->flows[i].pending, 0, __ATOMIC_RELAXED);
                         //// UDS_IMPL
 #ifdef CPU_FRIENDLY
@@ -625,6 +645,19 @@ static void generate_fetch_tokens()
                         ////
                         //printf("fetched for flow %d\n", i);
                         next_idx = (i + 1) % MAX_FLOWS;
+
+                        if (measure_token_cycles) {
+                            grant_ed = get_cycles();
+                            token_grant_cycles += (uint64_t)(grant_ed - grant_st);
+                            token_grant_cnt++;
+                            if (token_grant_cnt >= report_every) {
+                                printf("avg token_grant cycles %" PRIu64 " (n=%" PRIu64 ")\n",
+                                       token_grant_cycles / token_grant_cnt,
+                                       token_grant_cnt);
+                                token_grant_cycles = 0;
+                                token_grant_cnt = 0;
+                            }
+                        }
                         break;
                     } else {    // out of tokens
                         //printf("out of tokens %d\n");
@@ -641,11 +674,29 @@ static void generate_fetch_tokens()
                 if (start_flag)
                 {
                     start_flag = 0;
-                    start_cycle = get_cycles();
-                    __atomic_fetch_add(&cb.tokens, 1, __ATOMIC_RELAXED);
+                    if (measure_token_cycles) {
+                        cycles_t st_total = get_cycles();
+                        start_cycle = get_cycles();
+                        cycles_t st_issue = get_cycles();
+                        __atomic_fetch_add(&cb.tokens, 1, __ATOMIC_RELAXED);
+                        cycles_t ed_issue = get_cycles();
+                        cycles_t ed_total = ed_issue;
+                        token_gen_total_cycles += (uint64_t)(ed_total - st_total);
+                        token_gen_spin_cycles += 0;
+                        token_gen_issue_cycles += (uint64_t)(ed_issue - st_issue);
+                        token_gen_cnt++;
+                    } else {
+                        start_cycle = get_cycles();
+                        __atomic_fetch_add(&cb.tokens, 1, __ATOMIC_RELAXED);
+                    }
                 }
                 else
                 {
+                    cycles_t st_total = 0, st_spin = 0, ed_spin = 0, st_issue = 0, ed_issue = 0, ed_total = 0;
+                    if (measure_token_cycles) {
+                        st_total = get_cycles();
+                        st_spin = st_total;
+                    }
                     //while (get_cycles() - start_cycle < (cpu_mhz * chunk_size / temp) / SPLIT_QP_NUM_ONE_SIDED)
 #ifndef USE_TIMEFRAME
 #ifdef CPU_FRIENDLY
@@ -657,8 +708,34 @@ static void generate_fetch_tokens()
                     while (get_cycles() - start_cycle < cpu_mhz * TIMEFRAME)      // number of cycles needed to send 1 split chunk at current virtual link rate
 #endif
                         cpu_relax();
+
+                    if (measure_token_cycles)
+                        ed_spin = get_cycles();
                     start_cycle = get_cycles();
+
+                    if (measure_token_cycles)
+                        st_issue = get_cycles();
                     __atomic_fetch_add(&cb.tokens, 1, __ATOMIC_RELAXED);
+
+                    if (measure_token_cycles) {
+                        ed_issue = get_cycles();
+                        ed_total = ed_issue;
+                        token_gen_total_cycles += (uint64_t)(ed_total - st_total);
+                        token_gen_spin_cycles += (uint64_t)(ed_spin - st_spin);
+                        token_gen_issue_cycles += (uint64_t)(ed_issue - st_issue);
+                        token_gen_cnt++;
+                        if (token_gen_cnt >= report_every) {
+                            printf("avg token_gen_total cycles %" PRIu64 ", spin %" PRIu64 ", issue %" PRIu64 " (n=%" PRIu64 ")\n",
+                                   token_gen_total_cycles / token_gen_cnt,
+                                   token_gen_spin_cycles / token_gen_cnt,
+                                   token_gen_issue_cycles / token_gen_cnt,
+                                   token_gen_cnt);
+                            token_gen_total_cycles = 0;
+                            token_gen_spin_cycles = 0;
+                            token_gen_issue_cycles = 0;
+                            token_gen_cnt = 0;
+                        }
+                    }
                 }
             }
         }
